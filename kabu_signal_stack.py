@@ -1,10 +1,11 @@
-"""kabu_signal_stack.py — Redesigned signal stack + VeighNa strategy wrapper.
+"""kabu_signal_stack.py — Redesigned signal stack + VeighNa strategy wrapper.  [v3]
 
 Architecture (4 layers):
   [VeighNa TickData]
       → KabuTickAdapter    (field mapping, bid/ask reversal switch, sanity check)
       → TickSnapshot       (clean L1/L2 snapshot, up to 5 price levels)
-      → KabuSignalStack    (OBI / LOB-OFI / Tape-OFI / momentum / microprice tilt)
+      → KabuSignalStack    (OBI / LOB-OFI / Tape-OFI / momentum / microprice tilt /
+                            VWAP deviation / full-depth book imbalance)
       → KabuSignalStrategy (VeighNa CtaTemplate: state machine, order tracking, risk)
 
 Verified against official sources (as of 2025):
@@ -22,7 +23,7 @@ from __future__ import annotations
 import math
 from collections import deque
 from dataclasses import dataclass, field
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from enum import Enum
 from typing import Deque, List, Optional, Tuple
 
@@ -165,6 +166,7 @@ class KabuTickAdapter:
             asks=asks,
             last_price=_f("last_price"),
             volume=_f("volume"),
+            turnover=_f("turnover"),
             pricetick=max(1e-9, pricetick),
         )
 
@@ -228,6 +230,17 @@ class SignalConfig:
     w_tape_ofi: float = 1.0
     w_momentum: float = 0.5
     w_obi: float = 1.0
+    w_vwap: float = 0.8              # VWAP mean-reversion signal weight
+    w_book_depth: float = 0.5        # Full-depth book imbalance weight
+
+    # VWAP signal thresholds
+    vwap_long: float = 0.2           # price below VWAP by this fraction → long alpha
+    vwap_short: float = 0.2          # price above VWAP by this fraction → short alpha
+
+    # Book depth signal thresholds
+    book_depth_long: float = 0.15    # book_depth_ratio above this → long alpha
+    book_depth_short: float = 0.15   # book_depth_ratio below -this → short alpha
+    book_depth_levels: int = 10      # number of L2 levels to aggregate
 
     # Entry thresholds
     edge_score_long_threshold: float = 2.5
@@ -238,6 +251,7 @@ class SignalConfig:
     regime_window: int = 30
     noise_vol_threshold: float = 2.0
     regime_sample_interval: int = 5
+    sign_autocorr_threshold: float = 0.3  # lag-1 sign autocorrelation threshold for TREND/REVERSION
 
     # Adapter
     reverse_bid_ask: bool = False   # Set True if gateway passes raw kabu field names
@@ -267,6 +281,7 @@ class TickSnapshot:
     asks: List[Tuple[float, float]]
     last_price: float = 0.0
     volume: float = 0.0
+    turnover: float = 0.0      # cumulative session turnover (¥) — used for VWAP calculation
     pricetick: float = 1.0
 
     @property
@@ -377,6 +392,27 @@ def calc_tape_aggressor(
     return 0.0
 
 
+def calc_book_depth_ratio(
+    bids: List[Tuple[float, float]],
+    asks: List[Tuple[float, float]],
+    levels: int = 10,
+) -> float:
+    """Unweighted total book imbalance across all depth levels.
+
+    Complements ``calc_weighted_obi`` (which decays weight with depth) by
+    capturing large orders resting in deep levels — often a sign of
+    institutional intent that doesn't yet appear at the touch.
+
+    Returns a value in [-1, +1]:
+      +1  → all visible depth is on the bid side (strong buying interest)
+      -1  → all visible depth is on the ask side (strong selling interest)
+    """
+    bid_total = sum(s for _, s in bids[:levels])
+    ask_total = sum(s for _, s in asks[:levels])
+    total = bid_total + ask_total
+    return 0.0 if total <= 0 else (bid_total - ask_total) / total
+
+
 # ---------------------------------------------------------------------------
 # Signal engine
 # ---------------------------------------------------------------------------
@@ -418,6 +454,13 @@ class KabuSignalStack:
         self.adverse_selection: float = 0.0
         self.alpha_long_count: int = 0
         self.alpha_short_count: int = 0
+        self.vwap_signal: float = 0.0       # +1 = price well below VWAP (buy), -1 = above VWAP (sell)
+        self.book_depth_ratio: float = 0.0  # full-depth unweighted book imbalance
+
+        # VWAP cumulative accumulators (reset each session day)
+        self._sess_vol: float = 0.0
+        self._sess_turn: float = 0.0
+        self._sess_date: str = ""
 
         # Gate state
         self.g_spread_ok: bool = False
@@ -479,6 +522,8 @@ class KabuSignalStack:
         self._update_tape_ofi(snap, now)
         self._update_momentum(snap)
         self._update_regime(snap)
+        self._update_vwap_signal(snap)
+        self._update_book_depth(snap)
         self._update_fill(snap)
         self._update_gate_ev(snap)
         self._compute_edge()
@@ -554,6 +599,8 @@ class KabuSignalStack:
             "sig_fill_mode_long": self.fill_mode_long,
             "sig_taker_ev_long":  float(self.taker_ev_long),
             "sig_maker_ev_long":  float(self.maker_ev_long),
+            "sig_vwap":           float(self.vwap_signal),
+            "sig_book_depth":     float(self.book_depth_ratio),
         }
 
     # ------------------------------------------------------------------
@@ -668,6 +715,15 @@ class KabuSignalStack:
         self.momentum = 0.0 if mean == 0 else (self._mom_q[-1] - mean) / mean
 
     def _update_regime(self, snap: TickSnapshot) -> None:
+        """Detect market regime using lag-1 sign autocorrelation of returns.
+
+        ``sign_autocorr > +threshold``  → TREND    (returns tend to continue)
+        ``sign_autocorr < -threshold``  → REVERSION (returns tend to reverse)
+        otherwise                        → NOISE
+
+        Volatility gate (noise_vol_threshold) is applied first: if the
+        price is moving too fast the signal-to-noise ratio is poor.
+        """
         if self._tick_count % max(1, self.cfg.regime_sample_interval) != 0:
             return
         self._regime_q.append(snap.mid)
@@ -683,15 +739,64 @@ class KabuSignalStack:
         if len(rets) < 3:
             self.regime = "REVERSION"
             return
+
+        # Volatility gate — block noisy high-vol periods
         mean_ret = sum(rets) / len(rets)
         var = sum((r - mean_ret) ** 2 for r in rets) / len(rets)
         vol_ticks = math.sqrt(max(var, 0.0)) * snap.mid / max(self.pricetick, 1e-9)
         if vol_ticks >= self.cfg.noise_vol_threshold:
             self.regime = "NOISE"
-        elif abs(mean_ret) > 0.00005:
+            return
+
+        # Lag-1 sign autocorrelation
+        signs = [1 if r > 0 else (-1 if r < 0 else 0) for r in rets]
+        n = len(signs)
+        sign_autocorr = (
+            sum(signs[i] * signs[i - 1] for i in range(1, n)) / max(1, n - 1)
+        )
+        thr = self.cfg.sign_autocorr_threshold
+        if sign_autocorr >= thr:
             self.regime = "TREND"
-        else:
+        elif sign_autocorr <= -thr:
             self.regime = "REVERSION"
+        else:
+            self.regime = "NOISE"
+
+    def _update_vwap_signal(self, snap: TickSnapshot) -> None:
+        """Compute session VWAP from cumulative turnover/volume increments.
+
+        Price below VWAP → positive signal (mean-reversion buy pressure).
+        Price above VWAP → negative signal (sell pressure).
+        Normalised to [-1, +1] using a ±3 tick window.
+        VWAP accumulator resets each new calendar day.
+        """
+        date_str = snap.dt.strftime("%Y%m%d")
+        if date_str != self._sess_date:
+            # New session — reset accumulators
+            self._sess_date = date_str
+            self._sess_vol = 0.0
+            self._sess_turn = 0.0
+
+        if self._prev_snap is not None:
+            delta_vol  = max(0.0, snap.volume   - self._prev_snap.volume)
+            delta_turn = max(0.0, snap.turnover - self._prev_snap.turnover)
+            self._sess_vol  += delta_vol
+            self._sess_turn += delta_turn
+
+        if self._sess_vol <= 0:
+            self.vwap_signal = 0.0
+            return
+
+        vwap = self._sess_turn / self._sess_vol
+        # Negative displacement = price below VWAP → positive (buy) signal
+        raw_ticks = (vwap - snap.mid) / max(self.pricetick, 1e-9)
+        self.vwap_signal = max(-1.0, min(1.0, raw_ticks / 3.0))
+
+    def _update_book_depth(self, snap: TickSnapshot) -> None:
+        """Compute full-depth unweighted book imbalance."""
+        self.book_depth_ratio = calc_book_depth_ratio(
+            snap.bids, snap.asks, self.cfg.book_depth_levels
+        )
 
     def _update_fill(self, snap: TickSnapshot) -> None:
         spread = snap.spread_ticks
@@ -717,11 +822,13 @@ class KabuSignalStack:
     def _compute_edge(self) -> None:
         cfg = self.cfg
         self.edge_score = (
-            cfg.w_microprice * self.microprice_tilt
-            + cfg.w_lob_ofi  * self.lob_ofi
-            + cfg.w_tape_ofi * self.tape_ofi
-            + cfg.w_momentum * self.momentum
-            + cfg.w_obi      * self.obi
+            cfg.w_microprice  * self.microprice_tilt
+            + cfg.w_lob_ofi   * self.lob_ofi
+            + cfg.w_tape_ofi  * self.tape_ofi
+            + cfg.w_momentum  * self.momentum
+            + cfg.w_obi       * self.obi
+            + cfg.w_vwap      * self.vwap_signal
+            + cfg.w_book_depth * self.book_depth_ratio
         )
         lc = sc = 0
         if self.microprice_tilt >= cfg.microprice_tilt_long:   lc += 1
@@ -734,6 +841,10 @@ class KabuSignalStack:
         if self.momentum <= -cfg.momentum_short:                sc += 1
         if self.obi >= cfg.obi_long:                           lc += 1
         if self.obi <= -cfg.obi_short:                         sc += 1
+        if self.vwap_signal >= cfg.vwap_long:                  lc += 1
+        if self.vwap_signal <= -cfg.vwap_short:                sc += 1
+        if self.book_depth_ratio >= cfg.book_depth_long:       lc += 1
+        if self.book_depth_ratio <= -cfg.book_depth_short:     sc += 1
         self.alpha_long_count  = lc
         self.alpha_short_count = sc
 
@@ -811,7 +922,7 @@ if _VNPY_AVAILABLE:
         Commission uses kabu's ad-valorem model: max(commission_min, rate × value).
         """
 
-        author = "KabuSignalStack v2"
+        author = "KabuSignalStack v3"
 
         # --- Tunable parameters ---
         trade_volume: int = 100
@@ -838,12 +949,45 @@ if _VNPY_AVAILABLE:
         profit_ticks: float = 3.0
         loss_ticks: float = 2.0
         max_hold_seconds: float = 30.0
+        open_order_timeout_sec: float = 3.0
+        close_order_timeout_sec: float = 2.0
+        trailing_activate_ticks: float = 2.0
+        trailing_drawdown_ticks: float = 1.2
 
-        # Daily risk limit
+        # Timing and confirmation
+        strong_signal_threshold: float = 4.0
+        weak_signal_confirm_ticks: int = 2
+        entry_cooldown_sec: float = 0.4
+        no_new_entry_after: str = "15:24:00"
+        noise_regime_block: bool = True
+        spread_edge_penalty: float = 0.4
+
+        # Dynamic sizing
+        lot_size: int = 100
+        min_trade_volume: int = 100
+        max_trade_volume: int = 300
+        risk_scale_min: float = 0.4
+
+        # Daily risk limits
         max_daily_loss: float = -50_000.0
+        max_daily_drawdown: float = -30_000.0
+        max_daily_trades: int = 80
+        max_consecutive_losses: int = 4
+        loss_cooldown_sec: float = 180.0
+        max_order_req_per_sec: int = 5
 
         # Logging throttle interval
         log_interval_seconds: float = 10.0
+
+        # --- v3 parameters ---
+        # Execution quality
+        maker_escape_timeout_sec: float = 1.5    # cancel stale MAKER order and re-enter as TAKER
+        max_impact_pct: float = 0.5              # reject entry if vol > this × best-level size
+
+        # Risk completeness
+        fast_loss_ticks: float = 1.5             # fast-loss circuit breaker: ticks lost
+        fast_loss_sec: float = 3.0               # fast-loss circuit breaker: time window (seconds)
+        hot_open_guard: bool = True              # block entries during 09:00-09:02 and 12:30-12:32
 
         parameters = [
             "trade_volume", "max_position",
@@ -853,7 +997,18 @@ if _VNPY_AVAILABLE:
             "reverse_bid_ask", "auto_pricetick",
             "commission_rate", "commission_min",
             "profit_ticks", "loss_ticks", "max_hold_seconds",
-            "max_daily_loss", "log_interval_seconds",
+            "open_order_timeout_sec", "close_order_timeout_sec",
+            "trailing_activate_ticks", "trailing_drawdown_ticks",
+            "strong_signal_threshold", "weak_signal_confirm_ticks",
+            "entry_cooldown_sec", "no_new_entry_after",
+            "noise_regime_block", "spread_edge_penalty",
+            "lot_size", "min_trade_volume", "max_trade_volume", "risk_scale_min",
+            "max_daily_loss", "max_daily_drawdown", "max_daily_trades",
+            "max_consecutive_losses", "loss_cooldown_sec", "max_order_req_per_sec",
+            "log_interval_seconds",
+            # v3
+            "maker_escape_timeout_sec", "max_impact_pct",
+            "fast_loss_ticks", "fast_loss_sec", "hot_open_guard",
         ]
 
         # --- UI-visible variables ---
@@ -872,8 +1027,16 @@ if _VNPY_AVAILABLE:
         last_entry_price: float = 0.0   # Actual fill price from on_trade
         last_exit_price: float = 0.0    # Actual exit fill price from on_trade
         daily_pnl: float = 0.0
+        daily_trades: int = 0
+        consecutive_losses: int = 0
+        daily_drawdown: float = 0.0
+        risk_halt_reason: str = ""
+        order_req_1s: int = 0
         total_trades: int = 0
         last_signal: str = ""
+        sig_vwap: float = 0.0
+        sig_book_depth: float = 0.0
+        unrealized_pnl: float = 0.0
 
         variables = [
             "price_tick", "order_state",
@@ -882,7 +1045,9 @@ if _VNPY_AVAILABLE:
             "sig_adv_sel", "sig_fill_mode_long",
             "sig_taker_ev_long", "sig_maker_ev_long",
             "last_entry_price", "last_exit_price",
-            "daily_pnl", "total_trades", "last_signal",
+            "daily_pnl", "daily_trades", "consecutive_losses", "daily_drawdown",
+            "risk_halt_reason", "order_req_1s", "total_trades", "last_signal",
+            "sig_vwap", "sig_book_depth", "unrealized_pnl",
         ]
 
         def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
@@ -897,10 +1062,22 @@ if _VNPY_AVAILABLE:
             self._entry_fill_volume: float = 0.0
             self._entry_time: Optional[datetime] = None
             self._entry_direction: str = ""   # "LONG" | "SHORT"
+            self._entry_mode: str = ""        # "MAKER" | "TAKER" (for MAKER escape logic)
+            self._entry_volume: int = 0       # intended order volume (for MAKER escape re-entry)
+            self._open_trade_realized_pnl: float = 0.0
+            self._max_favorable_ticks: float = 0.0
 
             # Risk
             self._is_trading_allowed: bool = True
             self._current_date: str = ""
+            self._peak_daily_pnl: float = 0.0
+            self._risk_cooldown_until: Optional[datetime] = None
+            self._last_entry_attempt_dt: Optional[datetime] = None
+            self._signal_pending_dir: int = 0
+            self._signal_pending_count: int = 0
+            self._state_since: Optional[datetime] = None
+            self._order_req_ts: Deque[datetime] = deque()
+            self._last_rate_limit_log_dt: Optional[datetime] = None
 
             # Throttle timers
             self._last_log_dt: Optional[datetime] = None
@@ -933,6 +1110,7 @@ if _VNPY_AVAILABLE:
             )
             self.sig = KabuSignalStack(cfg, self.price_tick)
             self._reset_position_state()
+            self._parse_strategy_time_settings()
             self.write_log(
                 f"on_start pricetick={self.price_tick} "
                 f"reverse_bid_ask={self.reverse_bid_ask}"
@@ -940,7 +1118,7 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         def on_stop(self) -> None:
-            self.cancel_all()
+            self._rl_cancel_all(datetime.now())
             self.write_log(self.sig.summary())
             self.write_log(
                 f"on_stop daily_pnl={self.daily_pnl:.0f}JPY "
@@ -961,27 +1139,52 @@ if _VNPY_AVAILABLE:
 
             tick_dt = snap.dt
             self._sync_sig_vars()
+            self._update_unrealized_pnl(snap)
             self._check_date_reset(tick_dt)
             self._maybe_log(tick_dt)
+            self._check_pending_timeouts(tick_dt, snap)
 
             # 2. State machine guard — if not IDLE, only manage open position
             if self._order_state != OrderState.IDLE:
                 if self._order_state == OrderState.OPEN:
-                    self._manage_exit(snap, tick_dt)
+                    if not self._is_trading_allowed:
+                        self._force_flatten(snap, tick_dt, reason="risk_halt")
+                    else:
+                        self._manage_exit(snap, tick_dt)
                 self._throttled_put_event(tick_dt)
                 return
 
             # 3. Risk gate
+            if self._risk_cooldown_until and tick_dt < self._risk_cooldown_until:
+                self._throttled_put_event(tick_dt)
+                return
+
             if not self._is_trading_allowed or not self.sig.all_gates_ok:
                 self._throttled_put_event(tick_dt)
                 return
 
+            if not self._entry_time_allowed(tick_dt):
+                self._throttled_put_event(tick_dt)
+                return
+
+            if self._last_entry_attempt_dt:
+                if (tick_dt - self._last_entry_attempt_dt).total_seconds() < self.entry_cooldown_sec:
+                    self._throttled_put_event(tick_dt)
+                    return
+
             # 4. Entry signals
             pos_skew = self.pos / max(self.max_position, 1)
             if self.enable_long and self.sig.can_open_long(pos_skew=pos_skew):
-                self._enter_long(snap, tick_dt)
+                vol = self._compute_order_volume(+1)
+                if vol > 0 and self._entry_quality_ok(snap, +1, vol) and self._confirm_entry_signal(+1):
+                    self._enter_long(snap, tick_dt, vol)
             elif self.enable_short and self.sig.can_open_short(pos_skew=pos_skew):
-                self._enter_short(snap, tick_dt)
+                vol = self._compute_order_volume(-1)
+                if vol > 0 and self._entry_quality_ok(snap, -1, vol) and self._confirm_entry_signal(-1):
+                    self._enter_short(snap, tick_dt, vol)
+            else:
+                self._signal_pending_dir = 0
+                self._signal_pending_count = 0
 
             self._throttled_put_event(tick_dt)
 
@@ -990,49 +1193,77 @@ if _VNPY_AVAILABLE:
         # ------------------------------------------------------------------
 
         def on_trade(self, trade) -> None:
-            if self._order_state == OrderState.PENDING_OPEN:
-                # Opening fill
-                self._entry_fill_price = float(trade.price)
-                self._entry_fill_volume = float(trade.volume)
-                fill_dt = getattr(trade, "datetime", None)
-                if isinstance(fill_dt, datetime):
-                    self._entry_time = fill_dt
+            trade_dt = getattr(trade, "datetime", None)
+            if not isinstance(trade_dt, datetime):
+                trade_dt = datetime.now()
+
+            trade_price = float(trade.price)
+            trade_volume = float(trade.volume)
+            is_open_fill = (
+                (self._entry_direction == "LONG" and trade.direction == Direction.LONG)
+                or (self._entry_direction == "SHORT" and trade.direction == Direction.SHORT)
+            )
+            is_close_fill = (
+                (self._entry_direction == "LONG" and trade.direction == Direction.SHORT)
+                or (self._entry_direction == "SHORT" and trade.direction == Direction.LONG)
+            )
+
+            if self._order_state in (OrderState.PENDING_OPEN, OrderState.OPEN) and is_open_fill:
+                old_vol = self._entry_fill_volume
+                new_vol = old_vol + trade_volume
+                if new_vol > 0:
+                    self._entry_fill_price = (
+                        self._entry_fill_price * old_vol + trade_price * trade_volume
+                    ) / new_vol if old_vol > 0 else trade_price
+                self._entry_fill_volume = new_vol
+                self._entry_time = trade_dt
+                self._max_favorable_ticks = 0.0
                 self._order_state = OrderState.OPEN
+                self._state_since = trade_dt
                 self.last_entry_price = self._entry_fill_price
                 self.order_state = OrderState.OPEN.value
                 self.write_log(
                     f"FILL OPEN {self._entry_direction} "
-                    f"price={self._entry_fill_price:.1f} "
-                    f"vol={self._entry_fill_volume:.0f}"
+                    f"avg={self._entry_fill_price:.1f} vol={self._entry_fill_volume:.0f}"
                 )
 
-            elif self._order_state == OrderState.PENDING_CLOSE:
-                # Closing fill — compute net PnL from actual fill prices
-                exit_price = float(trade.price)
-                exit_volume = float(trade.volume)
+            elif self._order_state in (OrderState.PENDING_CLOSE, OrderState.OPEN) and is_close_fill:
+                realized_vol = min(trade_volume, max(self._entry_fill_volume, 0.0))
+                if realized_vol <= 0:
+                    realized_vol = trade_volume
                 direction_sign = +1 if self._entry_direction == "LONG" else -1
-                gross_pnl = (
-                    direction_sign
-                    * (exit_price - self._entry_fill_price)
-                    * exit_volume
+                gross_pnl_part = direction_sign * (trade_price - self._entry_fill_price) * realized_vol
+                commission_part = (
+                    self._calc_commission(trade_price, realized_vol)
+                    + self._calc_commission(self._entry_fill_price, realized_vol)
                 )
-                commission = (
-                    self._calc_commission(exit_price, exit_volume)
-                    + self._calc_commission(self._entry_fill_price, self._entry_fill_volume)
-                )
-                net_pnl = gross_pnl - commission
-                self.daily_pnl += net_pnl
-                self.total_trades += 1
-                self.last_exit_price = exit_price
-                self.write_log(
-                    f"FILL CLOSE {self._entry_direction} "
-                    f"exit={exit_price:.1f} "
-                    f"pnl={net_pnl:+.0f}JPY "
-                    f"daily={self.daily_pnl:.0f}JPY"
-                )
-                trade_dt = getattr(trade, "datetime", None)
-                self._check_daily_risk_halt(trade_dt)
-                self._reset_position_state()
+                self._open_trade_realized_pnl += gross_pnl_part - commission_part
+                self._entry_fill_volume = max(0.0, self._entry_fill_volume - realized_vol)
+                self.last_exit_price = trade_price
+
+                if abs(self.pos) == 0 or self._entry_fill_volume <= 1e-9:
+                    net_pnl = self._open_trade_realized_pnl
+                    self.daily_pnl += net_pnl
+                    self.daily_trades += 1
+                    self.total_trades += 1
+                    self._peak_daily_pnl = max(self._peak_daily_pnl, self.daily_pnl)
+                    self.daily_drawdown = self.daily_pnl - self._peak_daily_pnl
+                    if net_pnl < 0:
+                        self.consecutive_losses += 1
+                    else:
+                        self.consecutive_losses = 0
+                    self.write_log(
+                        f"FILL CLOSE {self._entry_direction} "
+                        f"exit={trade_price:.1f} pnl={net_pnl:+.0f}JPY "
+                        f"daily={self.daily_pnl:.0f}JPY"
+                    )
+                    self._check_daily_risk_halt(trade_dt)
+                    self._reset_position_state()
+                else:
+                    # Partial close: keep monitoring remaining position.
+                    self._order_state = OrderState.OPEN
+                    self._state_since = trade_dt
+                    self.order_state = OrderState.OPEN.value
 
             self.put_event()
 
@@ -1057,6 +1288,7 @@ if _VNPY_AVAILABLE:
                             f"Close order cancelled, will retry: {order.vt_orderid}"
                         )
                         self._order_state = OrderState.OPEN
+                        self._state_since = datetime.now()
                         self.order_state = OrderState.OPEN.value
 
             self.put_event()
@@ -1071,41 +1303,51 @@ if _VNPY_AVAILABLE:
         # Entry helpers
         # ------------------------------------------------------------------
 
-        def _enter_long(self, snap: TickSnapshot, tick_dt: datetime) -> None:
+        def _enter_long(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
             # MAKER: post limit at bid (may not fill); TAKER: lift the ask immediately
-            order_price = snap.bid1 if self.sig.fill_mode_long == "MAKER" else snap.ask1
-            ids = self.buy(order_price, self.trade_volume)
+            mode = self.sig.fill_mode_long
+            order_price = snap.bid1 if mode == "MAKER" else snap.ask1
+            ids = self._rl_buy(order_price, volume, tick_dt)
             if ids:
                 self._active_orderids = list(ids)
                 self._order_state = OrderState.PENDING_OPEN
                 self._entry_direction = "LONG"
+                self._entry_mode = mode
+                self._entry_volume = volume
                 self._entry_time = tick_dt
+                self._state_since = tick_dt
+                self._last_entry_attempt_dt = tick_dt
                 self.order_state = OrderState.PENDING_OPEN.value
                 self.last_signal = (
-                    f"LONG/{self.sig.fill_mode_long} "
+                    f"LONG/{mode} "
                     f"edge={self.sig.edge_score:+.2f}"
                 )
                 self.write_log(
-                    f"OPEN LONG @ {order_price:.1f} x{self.trade_volume} | "
+                    f"OPEN LONG @ {order_price:.1f} x{volume} | "
                     f"{self.last_signal}"
                 )
 
-        def _enter_short(self, snap: TickSnapshot, tick_dt: datetime) -> None:
+        def _enter_short(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
             # MAKER: post limit at ask; TAKER: hit the bid immediately
-            order_price = snap.ask1 if self.sig.fill_mode_short == "MAKER" else snap.bid1
-            ids = self.short(order_price, self.trade_volume)
+            mode = self.sig.fill_mode_short
+            order_price = snap.ask1 if mode == "MAKER" else snap.bid1
+            ids = self._rl_short(order_price, volume, tick_dt)
             if ids:
                 self._active_orderids = list(ids)
                 self._order_state = OrderState.PENDING_OPEN
                 self._entry_direction = "SHORT"
+                self._entry_mode = mode
+                self._entry_volume = volume
                 self._entry_time = tick_dt
+                self._state_since = tick_dt
+                self._last_entry_attempt_dt = tick_dt
                 self.order_state = OrderState.PENDING_OPEN.value
                 self.last_signal = (
-                    f"SHORT/{self.sig.fill_mode_short} "
+                    f"SHORT/{mode} "
                     f"edge={self.sig.edge_score:+.2f}"
                 )
                 self.write_log(
-                    f"OPEN SHORT @ {order_price:.1f} x{self.trade_volume} | "
+                    f"OPEN SHORT @ {order_price:.1f} x{volume} | "
                     f"{self.last_signal}"
                 )
 
@@ -1120,35 +1362,101 @@ if _VNPY_AVAILABLE:
             pt = max(self.price_tick, 1e-9)
             elapsed = (tick_dt - self._entry_time).total_seconds()
 
-            if self.pos > 0:
-                pnl_ticks = (snap.bid1 - self._entry_fill_price) / pt
-                should_exit = (
-                    self.sig.should_exit_long()         # Signal reversal
-                    or pnl_ticks >= self.profit_ticks   # Take-profit
-                    or pnl_ticks <= -self.loss_ticks    # Stop-loss
-                    or elapsed >= self.max_hold_seconds  # Timeout (unconditional)
-                )
-                if should_exit:
-                    ids = self.sell(snap.bid1 - pt, abs(self.pos))
+            # ----------------------------------------------------------------
+            # C1: Fast loss circuit breaker — aggressive immediate exit if
+            # the position loses fast_loss_ticks within fast_loss_sec of entry.
+            # Indicates we entered into a strongly directional move against us.
+            # ----------------------------------------------------------------
+            if elapsed <= self.fast_loss_sec:
+                if self.pos > 0:
+                    fast_pnl = (snap.bid1 - self._entry_fill_price) / pt
+                elif self.pos < 0:
+                    fast_pnl = (self._entry_fill_price - snap.ask1) / pt
+                else:
+                    fast_pnl = 0.0
+                if fast_pnl <= -self.fast_loss_ticks:
+                    # Aggressive market-clearing exit (no offset)
+                    if self.pos > 0:
+                        ids = self._rl_sell(snap.bid1, abs(self.pos), tick_dt)
+                    else:
+                        ids = self._rl_cover(snap.ask1, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
                         self._order_state = OrderState.PENDING_CLOSE
+                        self._state_since = tick_dt
+                        self.order_state = OrderState.PENDING_CLOSE.value
+                        self.write_log(
+                            f"[FAST LOSS] {fast_pnl:.1f}ticks in {elapsed:.1f}s → aggressive exit"
+                        )
+                    return
+
+            # ----------------------------------------------------------------
+            # Normal exit logic with two-tier pricing (B2):
+            #   • Urgent exits (stop-loss / timeout) → aggressive price (bid1 / ask1)
+            #   • Take-profit / signal exits         → gentle limit (bid1-pt / ask1+pt)
+            # ----------------------------------------------------------------
+            if self.pos > 0:
+                pnl_ticks = (snap.bid1 - self._entry_fill_price) / pt
+                self._max_favorable_ticks = max(self._max_favorable_ticks, pnl_ticks)
+                trailing_hit = (
+                    self._max_favorable_ticks >= self.trailing_activate_ticks
+                    and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
+                )
+                is_urgent = pnl_ticks <= -self.loss_ticks or elapsed >= self.max_hold_seconds
+                should_exit = (
+                    self.sig.should_exit_long()
+                    or pnl_ticks >= self.profit_ticks
+                    or is_urgent
+                    or trailing_hit
+                )
+                if should_exit:
+                    exit_price = snap.bid1 if is_urgent else snap.bid1 - pt
+                    ids = self._rl_sell(exit_price, abs(self.pos), tick_dt)
+                    if ids:
+                        self._active_orderids = list(ids)
+                        self._order_state = OrderState.PENDING_CLOSE
+                        self._state_since = tick_dt
                         self.order_state = OrderState.PENDING_CLOSE.value
 
             elif self.pos < 0:
                 pnl_ticks = (self._entry_fill_price - snap.ask1) / pt
+                self._max_favorable_ticks = max(self._max_favorable_ticks, pnl_ticks)
+                trailing_hit = (
+                    self._max_favorable_ticks >= self.trailing_activate_ticks
+                    and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
+                )
+                is_urgent = pnl_ticks <= -self.loss_ticks or elapsed >= self.max_hold_seconds
                 should_exit = (
                     self.sig.should_exit_short()
                     or pnl_ticks >= self.profit_ticks
-                    or pnl_ticks <= -self.loss_ticks
-                    or elapsed >= self.max_hold_seconds  # Timeout (unconditional)
+                    or is_urgent
+                    or trailing_hit
                 )
                 if should_exit:
-                    ids = self.cover(snap.ask1 + pt, abs(self.pos))
+                    exit_price = snap.ask1 if is_urgent else snap.ask1 + pt
+                    ids = self._rl_cover(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
                         self._order_state = OrderState.PENDING_CLOSE
+                        self._state_since = tick_dt
                         self.order_state = OrderState.PENDING_CLOSE.value
+
+        def _force_flatten(self, snap: TickSnapshot, tick_dt: datetime, reason: str) -> None:
+            """Immediate close path used by hard risk halt."""
+            if self.pos > 0:
+                ids = self._rl_sell(max(snap.bid1 - self.price_tick, self.price_tick), abs(self.pos), tick_dt)
+            elif self.pos < 0:
+                ids = self._rl_cover(snap.ask1 + self.price_tick, abs(self.pos), tick_dt)
+            else:
+                self._reset_position_state()
+                return
+
+            if ids:
+                self._active_orderids = list(ids)
+                self._order_state = OrderState.PENDING_CLOSE
+                self._state_since = tick_dt
+                self.order_state = OrderState.PENDING_CLOSE.value
+                self.write_log(f"[FORCE FLAT] reason={reason}")
 
         # ------------------------------------------------------------------
         # Risk / PnL helpers
@@ -1164,22 +1472,280 @@ if _VNPY_AVAILABLE:
             return max(self.commission_min, trade_value * self.commission_rate)
 
         def _check_daily_risk_halt(self, trade_dt=None) -> None:
-            if self.daily_pnl < self.max_daily_loss:
-                self._is_trading_allowed = False
-                now_dt = trade_dt if isinstance(trade_dt, datetime) else datetime.now()
-                self.sig.trigger_event_cooldown(now_dt)
-                self.write_log(
-                    f"[RISK HALT] daily_pnl={self.daily_pnl:.0f}JPY "
-                    f"< limit={self.max_daily_loss:.0f}JPY"
+            now_dt = trade_dt if isinstance(trade_dt, datetime) else datetime.now()
+
+            if self.consecutive_losses >= self.max_consecutive_losses:
+                self._risk_cooldown_until = now_dt + timedelta(seconds=self.loss_cooldown_sec)
+                self.risk_halt_reason = (
+                    f"consecutive_losses={self.consecutive_losses}, "
+                    f"cooldown={self.loss_cooldown_sec:.0f}s"
                 )
+                self.write_log(f"[RISK COOL] {self.risk_halt_reason}")
+
+            hard_halt_reason = ""
+            if self.daily_pnl < self.max_daily_loss:
+                hard_halt_reason = (
+                    f"daily_pnl={self.daily_pnl:.0f}JPY < limit={self.max_daily_loss:.0f}JPY"
+                )
+            elif self.daily_drawdown < self.max_daily_drawdown:
+                hard_halt_reason = (
+                    f"daily_drawdown={self.daily_drawdown:.0f}JPY < limit={self.max_daily_drawdown:.0f}JPY"
+                )
+            elif self.daily_trades >= self.max_daily_trades:
+                hard_halt_reason = (
+                    f"daily_trades={self.daily_trades} >= limit={self.max_daily_trades}"
+                )
+
+            if hard_halt_reason:
+                self._is_trading_allowed = False
+                self.risk_halt_reason = hard_halt_reason
+                self.sig.trigger_event_cooldown(now_dt)
+                self.write_log(f"[RISK HALT] {hard_halt_reason}")
 
         def _check_date_reset(self, dt: datetime) -> None:
             date_str = dt.strftime("%Y%m%d")
             if date_str != self._current_date:
                 self._current_date = date_str
                 self.daily_pnl = 0.0
+                self.daily_trades = 0
+                self.consecutive_losses = 0
+                self.daily_drawdown = 0.0
+                self._peak_daily_pnl = 0.0
+                self._risk_cooldown_until = None
+                self.risk_halt_reason = ""
+                self._order_req_ts.clear()
+                self.order_req_1s = 0
                 self._is_trading_allowed = True
                 self.write_log(f"New trading day: {date_str}")
+
+        def _check_pending_timeouts(self, now: datetime, snap: TickSnapshot) -> None:
+            """Cancel stale pending orders and recover state safely.
+
+            MAKER escape (B1): if a MAKER open order has been pending for
+            ``maker_escape_timeout_sec`` without filling, cancel it and
+            re-enter as a TAKER order (provided the signal is still valid).
+            This avoids sitting in an unfilled limit order while the market
+            moves against us (adverse selection).
+            """
+            if self._state_since is None:
+                return
+
+            elapsed = (now - self._state_since).total_seconds()
+
+            # --- MAKER escape: runs before the full open timeout ---
+            if (
+                self._order_state == OrderState.PENDING_OPEN
+                and self._entry_mode == "MAKER"
+                and elapsed >= self.maker_escape_timeout_sec
+                and elapsed < self.open_order_timeout_sec
+            ):
+                self.write_log(
+                    f"MAKER escape {elapsed:.2f}s -> cancel and re-enter TAKER"
+                )
+                self._rl_cancel_all(now)
+                self._active_orderids = []
+                # Re-enter as TAKER only if signal is still valid
+                ids = []
+                vol = self._entry_volume or 1
+                if self._entry_direction == "LONG" and self.sig.can_open_long():
+                    ids = self._rl_buy(snap.ask1, vol, now)
+                elif self._entry_direction == "SHORT" and self.sig.can_open_short():
+                    ids = self._rl_short(snap.bid1, vol, now)
+                if ids:
+                    self._active_orderids = list(ids)
+                    self._entry_mode = "TAKER"
+                    self._state_since = now
+                else:
+                    # Signal gone — abort entry
+                    self._reset_position_state()
+                return
+
+            # --- Full open timeout ---
+            if self._order_state == OrderState.PENDING_OPEN and elapsed >= self.open_order_timeout_sec:
+                self.write_log(
+                    f"OPEN timeout {elapsed:.2f}s -> cancel_all"
+                )
+                self._rl_cancel_all(now)
+                self._reset_position_state()
+                return
+
+            # --- Close timeout: aggressive TAKER retry (bid1 / ask1, no offset) ---
+            if self._order_state == OrderState.PENDING_CLOSE and elapsed >= self.close_order_timeout_sec:
+                self.write_log(
+                    f"CLOSE timeout {elapsed:.2f}s -> cancel_all and retry aggressive"
+                )
+                self._rl_cancel_all(now)
+                self._active_orderids = []
+                if self.pos > 0:
+                    ids = self._rl_sell(snap.bid1, abs(self.pos), now)   # aggressive: market-clearing
+                elif self.pos < 0:
+                    ids = self._rl_cover(snap.ask1, abs(self.pos), now)  # aggressive: market-clearing
+                else:
+                    self._reset_position_state()
+                    return
+                if ids:
+                    self._active_orderids = list(ids)
+                    self._state_since = now
+                    self._order_state = OrderState.PENDING_CLOSE
+                    self.order_state = OrderState.PENDING_CLOSE.value
+                else:
+                    self._order_state = OrderState.OPEN
+                    self.order_state = OrderState.OPEN.value
+                    self._state_since = now
+
+        def _parse_strategy_time_settings(self) -> None:
+            def _p(s: str, default: time) -> time:
+                try:
+                    hh, mm, ss = [int(x) for x in s.split(":")]
+                    return time(hh, mm, ss)
+                except Exception:
+                    return default
+
+            self._no_new_entry_after_time = _p(self.no_new_entry_after, time(15, 24, 0))
+
+        def _entry_time_allowed(self, dt: datetime) -> bool:
+            """Return True if new entries are allowed at the given datetime.
+
+            Guards applied:
+            1. no_new_entry_after: no entries after configured cutoff (default 15:24).
+            2. hot_open_guard: block entries during the first 2 minutes after
+               market open/reopen (09:00-09:02 and 12:30-12:32) when the order
+               book is thin, auction prints dominate, and signal quality is lowest.
+            """
+            tm = dt.time()
+            if tm >= self._no_new_entry_after_time:
+                return False
+            if self.hot_open_guard:
+                # Morning open guard
+                if time(9, 0, 0) <= tm < time(9, 2, 0):
+                    return False
+                # Afternoon re-open guard
+                if time(12, 30, 0) <= tm < time(12, 32, 0):
+                    return False
+            return True
+
+        def _confirm_entry_signal(self, direction: int) -> bool:
+            edge_abs = abs(self.sig.edge_score)
+            if edge_abs >= self.strong_signal_threshold:
+                self._signal_pending_dir = 0
+                self._signal_pending_count = 0
+                return True
+
+            if direction != self._signal_pending_dir:
+                self._signal_pending_dir = direction
+                self._signal_pending_count = 1
+                return False
+
+            self._signal_pending_count += 1
+            if self._signal_pending_count >= max(1, self.weak_signal_confirm_ticks):
+                self._signal_pending_dir = 0
+                self._signal_pending_count = 0
+                return True
+            return False
+
+        def _compute_order_volume(self, direction: int) -> int:
+            """Dynamic sizing from signal strength and current risk state."""
+            base = max(self.min_trade_volume, self.trade_volume)
+            edge_threshold = self.sig.edge_score_long_threshold if direction > 0 else self.sig.edge_score_short_threshold
+            strength = abs(self.sig.edge_score) / max(1e-9, edge_threshold)
+            strength_scale = min(1.8, max(0.6, strength))
+
+            dd_limit = abs(min(-1.0, self.max_daily_drawdown))
+            dd_ratio = min(1.0, abs(min(0.0, self.daily_drawdown)) / dd_limit)
+            dd_scale = max(self.risk_scale_min, 1.0 - 0.6 * dd_ratio)
+            loss_scale = max(self.risk_scale_min, 1.0 - 0.2 * self.consecutive_losses)
+
+            raw = int(base * strength_scale * dd_scale * loss_scale)
+            raw = max(self.min_trade_volume, min(self.max_trade_volume, raw))
+            lot = max(1, self.lot_size)
+            sized = (raw // lot) * lot
+            return max(0, sized)
+
+        def _entry_quality_ok(self, snap: TickSnapshot, direction: int, vol: int = 0) -> bool:
+            """Check qualitative entry conditions beyond the signal gate.
+
+            Args:
+                snap:      current tick snapshot
+                direction: +1 for long, -1 for short
+                vol:       intended order volume (for market impact check)
+            """
+            if self.noise_regime_block and self.sig.regime == "NOISE":
+                return False
+
+            spread_extra = max(0.0, snap.spread_ticks - 1.0) * self.spread_edge_penalty
+            if direction > 0:
+                required = self.sig.edge_score_long_threshold + spread_extra
+                if self.sig.edge_score < required:
+                    return False
+            else:
+                required = self.sig.edge_score_short_threshold + spread_extra
+                if self.sig.edge_score > -required:
+                    return False
+
+            # B3: Market impact check — reject if our order would consume more than
+            # max_impact_pct of the best-level size (signals poor liquidity for our size).
+            if vol > 0 and self.max_impact_pct > 0:
+                best_vol = snap.ask_vol1 if direction > 0 else snap.bid_vol1
+                if best_vol > 0 and vol / best_vol > self.max_impact_pct:
+                    return False
+
+            return True
+
+        def _trim_order_req_window(self, now: datetime) -> None:
+            cutoff = now - timedelta(seconds=1)
+            while self._order_req_ts and self._order_req_ts[0] < cutoff:
+                self._order_req_ts.popleft()
+            self.order_req_1s = len(self._order_req_ts)
+
+        def _can_send_order_req(self, now: datetime) -> bool:
+            self._trim_order_req_window(now)
+            if len(self._order_req_ts) < max(1, self.max_order_req_per_sec):
+                return True
+            if (
+                self._last_rate_limit_log_dt is None
+                or (now - self._last_rate_limit_log_dt).total_seconds() >= 1.0
+            ):
+                self._last_rate_limit_log_dt = now
+                self.write_log(
+                    f"[RATE LIMIT] order_req_1s={len(self._order_req_ts)} "
+                    f"limit={self.max_order_req_per_sec}"
+                )
+            return False
+
+        def _mark_order_req(self, now: datetime) -> None:
+            self._order_req_ts.append(now)
+            self.order_req_1s = len(self._order_req_ts)
+
+        def _rl_buy(self, price: float, volume: int, now: datetime):
+            if not self._can_send_order_req(now):
+                return []
+            self._mark_order_req(now)
+            return self.buy(price, volume)
+
+        def _rl_short(self, price: float, volume: int, now: datetime):
+            if not self._can_send_order_req(now):
+                return []
+            self._mark_order_req(now)
+            return self.short(price, volume)
+
+        def _rl_sell(self, price: float, volume: int, now: datetime):
+            if not self._can_send_order_req(now):
+                return []
+            self._mark_order_req(now)
+            return self.sell(price, volume)
+
+        def _rl_cover(self, price: float, volume: int, now: datetime):
+            if not self._can_send_order_req(now):
+                return []
+            self._mark_order_req(now)
+            return self.cover(price, volume)
+
+        def _rl_cancel_all(self, now: datetime) -> bool:
+            if not self._can_send_order_req(now):
+                return False
+            self._mark_order_req(now)
+            self.cancel_all()
+            return True
 
         # ------------------------------------------------------------------
         # UI sync helpers
@@ -1189,7 +1755,31 @@ if _VNPY_AVAILABLE:
             for k, v in self.sig.get_status_dict().items():
                 if hasattr(self, k):
                     setattr(self, k, v)
+            self._trim_order_req_window(datetime.now())
             self.order_state = self._order_state.value
+
+        def _update_unrealized_pnl(self, snap: TickSnapshot) -> None:
+            """Compute and update unrealized PnL for display in the UI variable.
+
+            Only meaningful while the strategy holds an open position (OPEN state).
+            Uses the current best bid/ask as the exit reference price (conservative:
+            always assumes you have to cross the spread to exit).
+            Includes a round-trip commission estimate so the displayed value
+            approximates the realised P&L if you were to exit immediately.
+            """
+            if self._order_state == OrderState.OPEN and self._entry_fill_price > 0:
+                if self._entry_direction == "LONG":
+                    # Exit ref: sell at bid1
+                    gross = (snap.bid1 - self._entry_fill_price) * self._entry_fill_volume
+                elif self._entry_direction == "SHORT":
+                    # Exit ref: cover at ask1
+                    gross = (self._entry_fill_price - snap.ask1) * self._entry_fill_volume
+                else:
+                    gross = 0.0
+                commission_est = self._calc_commission(snap.mid, self._entry_fill_volume)
+                self.unrealized_pnl = gross - commission_est
+            else:
+                self.unrealized_pnl = 0.0
 
         def _maybe_log(self, dt: datetime) -> None:
             if (
@@ -1199,7 +1789,9 @@ if _VNPY_AVAILABLE:
                 self._last_log_dt = dt
                 self.write_log(
                     f"{self.sig.summary()} | "
-                    f"pnl={self.daily_pnl:.0f}JPY trades={self.total_trades}"
+                    f"pnl={self.daily_pnl:.0f}JPY dd={self.daily_drawdown:.0f} "
+                    f"dtrades={self.daily_trades} total={self.total_trades} "
+                    f"loss_streak={self.consecutive_losses}"
                 )
 
         def _throttled_put_event(self, dt: datetime) -> None:
@@ -1233,4 +1825,10 @@ if _VNPY_AVAILABLE:
             self._entry_fill_volume = 0.0
             self._entry_time = None
             self._entry_direction = ""
+            self._entry_mode = ""
+            self._entry_volume = 0
+            self._open_trade_realized_pnl = 0.0
+            self._max_favorable_ticks = 0.0
+            self._state_since = None
             self.order_state = OrderState.IDLE.value
+            self.unrealized_pnl = 0.0

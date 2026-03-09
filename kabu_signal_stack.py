@@ -1270,7 +1270,10 @@ if _VNPY_AVAILABLE:
             self._entry_direction: str = ""   # "LONG" | "SHORT"
             self._entry_mode: str = ""        # "MAKER" | "TAKER" (for MAKER escape logic)
             self._entry_volume: int = 0       # intended order volume (for MAKER escape re-entry)
-            self._open_trade_realized_pnl: float = 0.0
+            self._opened_total_volume: float = 0.0
+            self._open_trade_gross_pnl: float = 0.0
+            self._close_turnover: float = 0.0
+            self._close_volume_accum: float = 0.0
             self._max_favorable_ticks: float = 0.0
             self._pending_exit_reason: str = ""   # set in _manage_exit, consumed in on_trade
 
@@ -1354,7 +1357,7 @@ if _VNPY_AVAILABLE:
                 return
 
             tick_dt = snap.dt
-            self._sync_sig_vars()
+            self._sync_sig_vars(tick_dt)
             self._update_unrealized_pnl(snap)
             self._check_date_reset(tick_dt)
             self._maybe_log(tick_dt)
@@ -1432,6 +1435,7 @@ if _VNPY_AVAILABLE:
                         self._entry_fill_price * old_vol + trade_price * trade_volume
                     ) / new_vol if old_vol > 0 else trade_price
                 self._entry_fill_volume = new_vol
+                self._opened_total_volume = new_vol
                 self._entry_time = trade_dt
                 self._max_favorable_ticks = 0.0
                 self._order_state = OrderState.OPEN
@@ -1449,16 +1453,21 @@ if _VNPY_AVAILABLE:
                     realized_vol = trade_volume
                 direction_sign = +1 if self._entry_direction == "LONG" else -1
                 gross_pnl_part = direction_sign * (trade_price - self._entry_fill_price) * realized_vol
-                commission_part = (
-                    self._calc_commission(trade_price, realized_vol)
-                    + self._calc_commission(self._entry_fill_price, realized_vol)
-                )
-                self._open_trade_realized_pnl += gross_pnl_part - commission_part
+                self._open_trade_gross_pnl += gross_pnl_part
+                self._close_turnover += trade_price * realized_vol
+                self._close_volume_accum += realized_vol
                 self._entry_fill_volume = max(0.0, self._entry_fill_volume - realized_vol)
                 self.last_exit_price = trade_price
 
                 if abs(self.pos) == 0 or self._entry_fill_volume <= 1e-9:
-                    net_pnl = self._open_trade_realized_pnl
+                    closed_volume = max(self._close_volume_accum, self._opened_total_volume, 0.0)
+                    if closed_volume > 0:
+                        close_avg = self._close_turnover / max(1e-9, self._close_volume_accum)
+                    else:
+                        close_avg = trade_price
+                    commission_open = self._calc_commission(self._entry_fill_price, self._opened_total_volume)
+                    commission_close = self._calc_commission(close_avg, closed_volume)
+                    net_pnl = self._open_trade_gross_pnl - commission_open - commission_close
                     self.daily_pnl += net_pnl
                     self.daily_trades += 1
                     self.total_trades += 1
@@ -1477,10 +1486,10 @@ if _VNPY_AVAILABLE:
                     entry_t = self._entry_time if self._entry_time else (trade_dt - timedelta(seconds=1))
                     rec = TradeRecord(
                         entry_price=self._entry_fill_price,
-                        exit_price=trade_price,
-                        volume=realized_vol,
+                        exit_price=close_avg,
+                        volume=closed_volume,
                         direction=direction_sign,
-                        commission=commission_part,
+                        commission=commission_open + commission_close,
                         entry_time=entry_t,
                         exit_time=trade_dt,
                         exit_reason=self._pending_exit_reason or "UNKNOWN",
@@ -1586,6 +1595,9 @@ if _VNPY_AVAILABLE:
 
         def _manage_exit(self, snap: TickSnapshot, tick_dt: datetime) -> None:
             if self._order_state != OrderState.OPEN or self._entry_time is None:
+                return
+            if self._active_orderids:
+                # Wait for outstanding cancel/ack before sending another close order.
                 return
 
             pt = max(self.price_tick, 1e-9)
@@ -1693,6 +1705,8 @@ if _VNPY_AVAILABLE:
 
         def _force_flatten(self, snap: TickSnapshot, tick_dt: datetime, reason: str) -> None:
             """Immediate close path used by hard risk halt."""
+            if self._active_orderids:
+                return
             if self.pos > 0:
                 ids = self._rl_sell(max(snap.bid1 - self.price_tick, self.price_tick), abs(self.pos), tick_dt)
             elif self.pos < 0:
@@ -1796,7 +1810,11 @@ if _VNPY_AVAILABLE:
                 self._active_orderids = []
                 # Re-enter as TAKER only if signal is still valid
                 ids = []
-                vol = self._entry_volume or 1
+                vol = max(self.min_trade_volume, self._entry_volume or self.min_trade_volume)
+                lot = max(1, self.lot_size)
+                vol = (vol // lot) * lot
+                if vol <= 0:
+                    vol = lot
                 if self._entry_direction == "LONG" and self.sig.can_open_long():
                     ids = self._rl_buy(snap.ask1, vol, now)
                 elif self._entry_direction == "SHORT" and self.sig.can_open_short():
@@ -1813,35 +1831,25 @@ if _VNPY_AVAILABLE:
             # --- Full open timeout ---
             if self._order_state == OrderState.PENDING_OPEN and elapsed >= self.open_order_timeout_sec:
                 self.write_log(
-                    f"OPEN timeout {elapsed:.2f}s -> cancel_all"
+                    f"OPEN timeout {elapsed:.2f}s -> send cancel and wait ack"
                 )
-                self._rl_cancel_all(now)
-                self._reset_position_state()
+                sent = self._rl_cancel_all(now)
+                if sent:
+                    self._state_since = now
                 return
 
             # --- Close timeout: aggressive TAKER retry (bid1 / ask1, no offset) ---
             if self._order_state == OrderState.PENDING_CLOSE and elapsed >= self.close_order_timeout_sec:
                 self.write_log(
-                    f"CLOSE timeout {elapsed:.2f}s -> cancel_all and retry aggressive"
+                    f"CLOSE timeout {elapsed:.2f}s -> send cancel and retry after ack"
                 )
-                self._rl_cancel_all(now)
-                self._active_orderids = []
-                if self.pos > 0:
-                    ids = self._rl_sell(snap.bid1, abs(self.pos), now)   # aggressive: market-clearing
-                elif self.pos < 0:
-                    ids = self._rl_cover(snap.ask1, abs(self.pos), now)  # aggressive: market-clearing
-                else:
-                    self._reset_position_state()
-                    return
-                if ids:
-                    self._active_orderids = list(ids)
-                    self._state_since = now
-                    self._order_state = OrderState.PENDING_CLOSE
-                    self.order_state = OrderState.PENDING_CLOSE.value
-                else:
+                sent = self._rl_cancel_all(now)
+                if sent:
+                    # Move back to OPEN and wait for cancel update before new close.
                     self._order_state = OrderState.OPEN
                     self.order_state = OrderState.OPEN.value
                     self._state_since = now
+                return
 
         def _parse_strategy_time_settings(self) -> None:
             def _p(s: str, default: time) -> time:
@@ -1988,19 +1996,24 @@ if _VNPY_AVAILABLE:
             return self.short(price, volume)
 
         def _rl_sell(self, price: float, volume: int, now: datetime):
-            # Close-first: bypasses the per-second window so SL/TP are never blocked
-            # by a full open-order quota.  Only its own shorter interval applies.
+            # Respect global request budget while keeping a short close interval.
             if self._last_close_order_ts is not None:
                 if (now - self._last_close_order_ts).total_seconds() * 1000 < self.close_min_interval_ms:
                     return []
+            if not self._can_send_order_req(now):
+                return []
             self._last_close_order_ts = now
+            self._mark_order_req(now)
             return self.sell(price, volume)
 
         def _rl_cover(self, price: float, volume: int, now: datetime):
             if self._last_close_order_ts is not None:
                 if (now - self._last_close_order_ts).total_seconds() * 1000 < self.close_min_interval_ms:
                     return []
+            if not self._can_send_order_req(now):
+                return []
             self._last_close_order_ts = now
+            self._mark_order_req(now)
             return self.cover(price, volume)
 
         def _rl_cancel_all(self, now: datetime) -> bool:
@@ -2014,11 +2027,11 @@ if _VNPY_AVAILABLE:
         # UI sync helpers
         # ------------------------------------------------------------------
 
-        def _sync_sig_vars(self) -> None:
+        def _sync_sig_vars(self, now: Optional[datetime] = None) -> None:
             for k, v in self.sig.get_status_dict().items():
                 if hasattr(self, k):
                     setattr(self, k, v)
-            self._trim_order_req_window(datetime.now())
+            self._trim_order_req_window(now or datetime.now())
             self.order_state = self._order_state.value
             # v4: update PnL stat variables for UI display
             stats = self._pnl_tracker.stats()
@@ -2045,7 +2058,10 @@ if _VNPY_AVAILABLE:
                     gross = (self._entry_fill_price - snap.ask1) * self._entry_fill_volume
                 else:
                     gross = 0.0
-                commission_est = self._calc_commission(snap.mid, self._entry_fill_volume)
+                commission_est = (
+                    self._calc_commission(self._entry_fill_price, self._entry_fill_volume)
+                    + self._calc_commission(snap.mid, self._entry_fill_volume)
+                )
                 self.unrealized_pnl = gross - commission_est
             else:
                 self.unrealized_pnl = 0.0
@@ -2096,7 +2112,10 @@ if _VNPY_AVAILABLE:
             self._entry_direction = ""
             self._entry_mode = ""
             self._entry_volume = 0
-            self._open_trade_realized_pnl = 0.0
+            self._opened_total_volume = 0.0
+            self._open_trade_gross_pnl = 0.0
+            self._close_turnover = 0.0
+            self._close_volume_accum = 0.0
             self._max_favorable_ticks = 0.0
             self._state_since = None
             self.order_state = OrderState.IDLE.value

@@ -1392,6 +1392,9 @@ if _VNPY_AVAILABLE:
 
             # Signal engine (rebuilt with live parameters in on_start)
             self.sig = KabuSignalStack(SignalConfig(), 1.0)
+            # Defensive default: allows on_tick to run safely even if on_start
+            # has not parsed time settings yet.
+            self._no_new_entry_after_time: time = time(15, 24, 0)
 
         # ------------------------------------------------------------------
         # Lifecycle
@@ -2318,7 +2321,8 @@ if _VNPY_AVAILABLE:
                book is thin, auction prints dominate, and signal quality is lowest.
             """
             tm = dt.time()
-            if tm >= self._no_new_entry_after_time:
+            cutoff = getattr(self, "_no_new_entry_after_time", time(15, 24, 0))
+            if tm >= cutoff:
                 return False
             if self.hot_open_guard:
                 # Morning open guard

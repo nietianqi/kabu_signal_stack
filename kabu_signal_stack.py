@@ -1143,6 +1143,7 @@ if _VNPY_AVAILABLE:
         max_hold_seconds: float = 30.0
         open_order_timeout_sec: float = 3.0
         close_order_timeout_sec: float = 2.0
+        taker_exit_extra_ticks: float = 0.0
         trailing_activate_ticks: float = 2.0
         trailing_drawdown_ticks: float = 1.2
 
@@ -1224,7 +1225,7 @@ if _VNPY_AVAILABLE:
             "reverse_bid_ask", "auto_pricetick",
             "commission_rate", "commission_min",
             "profit_ticks", "loss_ticks", "max_hold_seconds",
-            "open_order_timeout_sec", "close_order_timeout_sec",
+            "open_order_timeout_sec", "close_order_timeout_sec", "taker_exit_extra_ticks",
             "trailing_activate_ticks", "trailing_drawdown_ticks",
             "strong_signal_threshold", "weak_signal_confirm_ticks",
             "signal_confirm_expire_sec",
@@ -1371,6 +1372,12 @@ if _VNPY_AVAILABLE:
             pt = self.get_pricetick()
             if pt and pt > 0:
                 self.price_tick = float(pt)
+
+            if self.reverse_bid_ask:
+                self.write_log(
+                    "[WARN] reverse_bid_ask=True. With vnpy_kabu gateway this is often wrong. "
+                    "If you see 'Bad tick skipped (bid>=ask)', set reverse_bid_ask=False."
+                )
 
             # Step 3: rebuild signal engine from strategy parameters.
             cfg = SignalConfig(
@@ -1893,6 +1900,7 @@ if _VNPY_AVAILABLE:
                 return
 
             pt = max(self.price_tick, 1e-9)
+            extra = max(0.0, float(self.taker_exit_extra_ticks)) * pt
             elapsed = (tick_dt - self._entry_time).total_seconds()
 
             # ----------------------------------------------------------------
@@ -1965,8 +1973,8 @@ if _VNPY_AVAILABLE:
                         # MAKER exit: post sell at ask 遶翫・capture spread (鬯ｮ蛟・ｽｻ・ｷ陷ｿ閧ｴ・ｸ繝ｻ
                         exit_price = snap.ask1
                     else:
-                        # TAKER exit fallback: cross the bid
-                        exit_price = snap.bid1 - pt
+                        # TAKER exit fallback: hit best bid (optional extra slip configurable)
+                        exit_price = snap.bid1 - extra
                     ids = self._rl_sell(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
@@ -2009,8 +2017,8 @@ if _VNPY_AVAILABLE:
                         # MAKER exit: post buy at bid 遶翫・capture spread (闖ｴ諠ｹ・ｻ・ｷ陷ｿ閧ｴ・ｸ繝ｻ
                         exit_price = snap.bid1
                     else:
-                        # TAKER exit fallback: cross the ask
-                        exit_price = snap.ask1 + pt
+                        # TAKER exit fallback: lift best ask (optional extra slip configurable)
+                        exit_price = snap.ask1 + extra
                     ids = self._rl_cover(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
@@ -2023,10 +2031,12 @@ if _VNPY_AVAILABLE:
             if self._active_orderids:
                 return
             self._clear_pending_auto_tp()
+            pt = max(self.price_tick, 1e-9)
+            extra = max(0.0, float(self.taker_exit_extra_ticks)) * pt
             if self.pos > 0:
-                ids = self._rl_sell(max(snap.bid1 - self.price_tick, self.price_tick), abs(self.pos), tick_dt)
+                ids = self._rl_sell(max(snap.bid1 - extra, pt), abs(self.pos), tick_dt)
             elif self.pos < 0:
-                ids = self._rl_cover(snap.ask1 + self.price_tick, abs(self.pos), tick_dt)
+                ids = self._rl_cover(snap.ask1 + extra, abs(self.pos), tick_dt)
             else:
                 self._reset_position_state()
                 return

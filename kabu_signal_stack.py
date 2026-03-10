@@ -1255,6 +1255,14 @@ if _VNPY_AVAILABLE:
         smart_cancel_on_flip: bool = True        # When True: cancel PENDING_OPEN order immediately
                                                  # if the entry signal reverses (no waiting for timeout)
 
+        # --- v5 parameters ---
+        # Per-trade JPY emergency stop (from reference strategy)
+        max_loss_per_trade_jpy: float = 0.0      # 0=disabled; emergency flat when unrealized_pnl < -this
+                                                  # Works even when hold_if_loss=True (hard floor)
+
+        # Verbose logging control (from reference strategy)
+        verbose_log: bool = False                 # True: output detailed debug logs (rate-limit reasons, etc.)
+
         parameters = [
             "trade_volume", "max_position",
             "enable_long", "enable_short",
@@ -1285,6 +1293,9 @@ if _VNPY_AVAILABLE:
             "auto_tp_retry_max", "auto_tp_retry_delay_sec",
             "smart_cancel_on_flip",
             "max_tick_stale_seconds", "stale_feed_force_flatten",
+            # v5
+            "max_loss_per_trade_jpy",
+            "verbose_log",
         ]
 
         # --- UI-visible variables ---
@@ -1396,6 +1407,10 @@ if _VNPY_AVAILABLE:
             # has not parsed time settings yet.
             self._no_new_entry_after_time: time = time(15, 24, 0)
 
+            # v5: periodic pricetick verification
+            self._price_tick_verified: bool = False
+            self._last_price_tick_check_dt: Optional[datetime] = None
+
         # ------------------------------------------------------------------
         # Lifecycle
         # ------------------------------------------------------------------
@@ -1441,6 +1456,51 @@ if _VNPY_AVAILABLE:
                 f"reverse_bid_ask={self.reverse_bid_ask}"
             )
             self.put_event()
+
+        # ------------------------------------------------------------------
+        # v5: Periodic pricetick verification & verbose logging helpers
+        # ------------------------------------------------------------------
+
+        def _periodic_verify_price_tick(self, now: datetime) -> None:
+            """Re-read pricetick from contract every 30 s.
+
+            Prevents the strategy from running with a stale fallback=1.0 when
+            the kabu gateway loads contract data with a delay after on_start.
+            Once successfully verified the check is skipped for efficiency.
+            (Inspired by kabu_micro_edge_pro _periodic_verify_price_tick.)
+            """
+            if self._price_tick_verified:
+                return
+            if (self._last_price_tick_check_dt is not None and
+                    (now - self._last_price_tick_check_dt).total_seconds() < 30.0):
+                return
+            self._last_price_tick_check_dt = now
+            try:
+                me = getattr(getattr(self, "cta_engine", None), "main_engine", None)
+                if me is None:
+                    return
+                contract = me.get_contract(self.vt_symbol)
+                if contract and hasattr(contract, "pricetick") and contract.pricetick > 0:
+                    new_pt = float(contract.pricetick)
+                    if abs(new_pt - self.price_tick) > 1e-9:
+                        self.write_log(
+                            f"[pricetick] 自动修正: {self.price_tick} → {new_pt} (合约延迟加载)"
+                        )
+                        self.price_tick = new_pt
+                        self.sig.price_tick = new_pt   # propagate to signal engine
+                    self._price_tick_verified = True
+            except Exception:
+                pass  # silent fail; will retry in 30 s
+
+        def _vlog(self, msg: str) -> None:
+            """Verbose log: only emits when verbose_log=True.
+
+            Use for high-frequency debug messages (rate-limit reasons, signal
+            gate traces, etc.).  Critical events (fills, risk triggers) should
+            always use write_log() directly.
+            """
+            if self.verbose_log:
+                self.write_log(msg)
 
         def _force_subscribe(self) -> None:
             """Best-effort subscribe using the known contract gateway first."""
@@ -1498,6 +1558,10 @@ if _VNPY_AVAILABLE:
             self._last_recv_time = datetime.now()
             self._tick_stale_state = False
             self._stale_force_flatten_pending = False
+
+            # v5: periodic pricetick verification (re-read every 30 s until confirmed)
+            self._periodic_verify_price_tick(tick_dt)
+
             self._sync_sig_vars(tick_dt)
             self._update_unrealized_pnl(snap)
             self._check_date_reset(tick_dt)
@@ -1654,12 +1718,7 @@ if _VNPY_AVAILABLE:
                         self.consecutive_losses += 1
                     else:
                         self.consecutive_losses = 0
-                    self.write_log(
-                        f"FILL CLOSE {self._entry_direction} "
-                        f"exit={trade_price:.1f} pnl={net_pnl:+.0f}JPY "
-                        f"daily={self.daily_pnl:.0f}JPY"
-                    )
-                    # v4: record trade for PnL statistics
+                    # v4/v5: record trade first, then emit enhanced close summary
                     entry_t = self._entry_time if self._entry_time else (trade_dt - timedelta(seconds=1))
                     rec = TradeRecord(
                         entry_price=self._entry_fill_price,
@@ -1672,6 +1731,20 @@ if _VNPY_AVAILABLE:
                         exit_reason=self._pending_exit_reason or "UNKNOWN",
                     )
                     self._pnl_tracker.record(rec)
+                    # Enhanced close summary (v5: emoji + hold time + running stats)
+                    hold_sec = (trade_dt - entry_t).total_seconds()
+                    _stats = self._pnl_tracker.stats()
+                    _wr_str = f"{_stats.get('win_rate', 0.0) * 100:.1f}%" if _stats else "—"
+                    _pf_str = f"{_stats.get('profit_factor', 0.0):.2f}" if _stats else "—"
+                    _icon = "🟢盈" if net_pnl > 0 else ("🔴亏" if net_pnl < 0 else "⚪平")
+                    _reason = self._pending_exit_reason or "?"
+                    self.write_log(
+                        f"[平仓{_icon}] {self._entry_direction} {_reason} "
+                        f"entry={self._entry_fill_price:.1f}→exit={close_avg:.1f} "
+                        f"{net_pnl:+.0f}¥ 持{hold_sec:.0f}s | "
+                        f"今日:{self.daily_pnl:+.0f}¥({self.daily_trades}笔) "
+                        f"胜率:{_wr_str} PF:{_pf_str}"
+                    )
                     self._check_daily_risk_halt(trade_dt)
                     self._reset_position_state()
                 else:
@@ -1945,6 +2018,39 @@ if _VNPY_AVAILABLE:
             pt = max(self.price_tick, 1e-9)
             extra = max(0.0, float(self.taker_exit_extra_ticks)) * pt
             elapsed = (tick_dt - self._entry_time).total_seconds()
+
+            # ----------------------------------------------------------------
+            # C0: JPY per-trade emergency stop (highest priority, overrides hold_if_loss)
+            # Prevents unlimited loss when hold_if_loss=True or loss_ticks is wide.
+            # Inspired by max_loss_per_trade in kabu_micro_edge_pro strategy.
+            # ----------------------------------------------------------------
+            if self.max_loss_per_trade_jpy > 0 and self._entry_fill_price > 0:
+                direction_sign = +1 if self._entry_direction == "LONG" else -1
+                ref_price = snap.bid1 if self._entry_direction == "LONG" else snap.ask1
+                unrealized_jpy = (
+                    direction_sign
+                    * (ref_price - self._entry_fill_price)
+                    * abs(self._entry_fill_volume)
+                )
+                if unrealized_jpy < -self.max_loss_per_trade_jpy:
+                    self.write_log(
+                        f"🚨 [EMER_LOSS] 单笔亏损 {unrealized_jpy:.0f}¥ "
+                        f"< -{self.max_loss_per_trade_jpy:.0f}¥ → 紧急平仓"
+                    )
+                    self._pending_exit_reason = "EMER_LOSS"
+                    self._clear_pending_auto_tp()
+                    exit_price = snap.bid1 if self._entry_direction == "LONG" else snap.ask1
+                    vol = int(round(abs(self._entry_fill_volume)))
+                    if self._entry_direction == "LONG":
+                        ids = self._rl_sell(exit_price, vol, tick_dt)
+                    else:
+                        ids = self._rl_cover(exit_price, vol, tick_dt)
+                    if ids:
+                        self._active_orderids = list(ids)
+                        self._order_state = OrderState.PENDING_CLOSE
+                        self._state_since = tick_dt
+                        self.order_state = OrderState.PENDING_CLOSE.value
+                    return
 
             # ----------------------------------------------------------------
             # C1: Fast loss circuit breaker 遯ｶ繝ｻaggressive immediate exit if
@@ -2427,7 +2533,7 @@ if _VNPY_AVAILABLE:
                 or (now - self._last_rate_limit_log_dt).total_seconds() >= 1.0
             ):
                 self._last_rate_limit_log_dt = now
-                self.write_log(
+                self._vlog(
                     f"[RATE LIMIT] order_req_1s={len(self._order_req_ts)} "
                     f"limit={self.max_order_req_per_sec}"
                 )

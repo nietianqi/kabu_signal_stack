@@ -1191,6 +1191,11 @@ if _VNPY_AVAILABLE:
         hold_if_loss: bool = False               # When True: suppress SL & fast-loss exits;
                                                  # position exits only on TP/TIMEOUT/TRAILING/SIGNAL_FLIP
 
+        # MAKER mode override
+        force_maker_mode: bool = False           # When True: always enter at bid(long)/ask(short),
+                                                 # exit at ask(long)/bid(short) — captures the spread.
+                                                 # When False: signal engine decides MAKER vs TAKER.
+
         parameters = [
             "trade_volume", "max_position",
             "enable_long", "enable_short",
@@ -1215,6 +1220,7 @@ if _VNPY_AVAILABLE:
             "znorm_lookback", "flow_flip_threshold",
             "open_min_interval_ms", "close_min_interval_ms",
             "hold_if_loss",
+            "force_maker_mode",
         ]
 
         # --- UI-visible variables ---
@@ -1609,7 +1615,8 @@ if _VNPY_AVAILABLE:
 
         def _enter_long(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
             # MAKER: post limit at bid (may not fill); TAKER: lift the ask immediately
-            mode = self.sig.fill_mode_long
+            # force_maker_mode overrides signal-engine's MAKER/TAKER decision
+            mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_long
             order_price = snap.bid1 if mode == "MAKER" else snap.ask1
             ids = self._rl_buy(order_price, volume, tick_dt)
             if ids:
@@ -1633,7 +1640,8 @@ if _VNPY_AVAILABLE:
 
         def _enter_short(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
             # MAKER: post limit at ask; TAKER: hit the bid immediately
-            mode = self.sig.fill_mode_short
+            # force_maker_mode overrides signal-engine's MAKER/TAKER decision
+            mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_short
             order_price = snap.ask1 if mode == "MAKER" else snap.bid1
             ids = self._rl_short(order_price, volume, tick_dt)
             if ids:
@@ -1731,7 +1739,15 @@ if _VNPY_AVAILABLE:
                         self._pending_exit_reason = "TRAILING"
                     else:
                         self._pending_exit_reason = "SIGNAL_FLIP"
-                    exit_price = snap.bid1 if is_urgent else snap.bid1 - pt
+                    if is_urgent:
+                        # Aggressive taker: sell at best bid immediately
+                        exit_price = snap.bid1
+                    elif self._entry_mode == "MAKER":
+                        # MAKER exit: post sell at ask → capture spread (高价反済)
+                        exit_price = snap.ask1
+                    else:
+                        # TAKER exit fallback: cross the bid
+                        exit_price = snap.bid1 - pt
                     ids = self._rl_sell(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
@@ -1766,7 +1782,15 @@ if _VNPY_AVAILABLE:
                         self._pending_exit_reason = "TRAILING"
                     else:
                         self._pending_exit_reason = "SIGNAL_FLIP"
-                    exit_price = snap.ask1 if is_urgent else snap.ask1 + pt
+                    if is_urgent:
+                        # Aggressive taker: cover at best ask immediately
+                        exit_price = snap.ask1
+                    elif self._entry_mode == "MAKER":
+                        # MAKER exit: post buy at bid → capture spread (低价反済)
+                        exit_price = snap.bid1
+                    else:
+                        # TAKER exit fallback: cross the ask
+                        exit_price = snap.ask1 + pt
                     ids = self._rl_cover(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)

@@ -1187,6 +1187,10 @@ if _VNPY_AVAILABLE:
         open_min_interval_ms:  float = 100.0     # minimum ms between two consecutive open orders
         close_min_interval_ms: float = 50.0      # minimum ms between two consecutive close orders
 
+        # Hold-through-loss mode
+        hold_if_loss: bool = False               # When True: suppress SL & fast-loss exits;
+                                                 # position exits only on TP/TIMEOUT/TRAILING/SIGNAL_FLIP
+
         parameters = [
             "trade_volume", "max_position",
             "enable_long", "enable_short",
@@ -1210,6 +1214,7 @@ if _VNPY_AVAILABLE:
             # v4
             "znorm_lookback", "flow_flip_threshold",
             "open_min_interval_ms", "close_min_interval_ms",
+            "hold_if_loss",
         ]
 
         # --- UI-visible variables ---
@@ -1668,8 +1673,9 @@ if _VNPY_AVAILABLE:
             # C1: Fast loss circuit breaker — aggressive immediate exit if
             # the position loses fast_loss_ticks within fast_loss_sec of entry.
             # Indicates we entered into a strongly directional move against us.
+            # Disabled when hold_if_loss=True (never cut on fast adverse move).
             # ----------------------------------------------------------------
-            if elapsed <= self.fast_loss_sec:
+            if not self.hold_if_loss and elapsed <= self.fast_loss_sec:
                 if self.pos > 0:
                     fast_pnl = (snap.bid1 - self._entry_fill_price) / pt
                 elif self.pos < 0:
@@ -1705,7 +1711,9 @@ if _VNPY_AVAILABLE:
                     self._max_favorable_ticks >= self.trailing_activate_ticks
                     and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
                 )
-                is_urgent = pnl_ticks <= -self.loss_ticks or elapsed >= self.max_hold_seconds
+                # When hold_if_loss=True: suppress fixed-SL; only timeout triggers urgency
+                sl_triggered = (pnl_ticks <= -self.loss_ticks) and not self.hold_if_loss
+                is_urgent = sl_triggered or elapsed >= self.max_hold_seconds
                 should_exit = (
                     self.sig.should_exit_long()
                     or pnl_ticks >= self.profit_ticks
@@ -1713,7 +1721,7 @@ if _VNPY_AVAILABLE:
                     or trailing_hit
                 )
                 if should_exit:
-                    if pnl_ticks <= -self.loss_ticks:
+                    if sl_triggered:
                         self._pending_exit_reason = "SL"
                     elif elapsed >= self.max_hold_seconds:
                         self._pending_exit_reason = "TIMEOUT"
@@ -1738,7 +1746,9 @@ if _VNPY_AVAILABLE:
                     self._max_favorable_ticks >= self.trailing_activate_ticks
                     and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
                 )
-                is_urgent = pnl_ticks <= -self.loss_ticks or elapsed >= self.max_hold_seconds
+                # When hold_if_loss=True: suppress fixed-SL; only timeout triggers urgency
+                sl_triggered = (pnl_ticks <= -self.loss_ticks) and not self.hold_if_loss
+                is_urgent = sl_triggered or elapsed >= self.max_hold_seconds
                 should_exit = (
                     self.sig.should_exit_short()
                     or pnl_ticks >= self.profit_ticks
@@ -1746,7 +1756,7 @@ if _VNPY_AVAILABLE:
                     or trailing_hit
                 )
                 if should_exit:
-                    if pnl_ticks <= -self.loss_ticks:
+                    if sl_triggered:
                         self._pending_exit_reason = "SL"
                     elif elapsed >= self.max_hold_seconds:
                         self._pending_exit_reason = "TIMEOUT"

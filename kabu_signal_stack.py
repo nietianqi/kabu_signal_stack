@@ -1,21 +1,21 @@
-"""kabu_signal_stack.py 窶・Redesigned signal stack + VeighNa strategy wrapper.  [v3]
+﻿"""kabu_signal_stack.py 遯ｶ繝ｻRedesigned signal stack + VeighNa strategy wrapper.  [v3]
 
 Architecture (4 layers):
   [VeighNa TickData]
-      竊・KabuTickAdapter    (field mapping, bid/ask reversal switch, sanity check)
-      竊・TickSnapshot       (clean L1/L2 snapshot, up to 5 price levels)
-      竊・KabuSignalStack    (OBI / LOB-OFI / Tape-OFI / momentum / microprice tilt /
+      遶翫・KabuTickAdapter    (field mapping, bid/ask reversal switch, sanity check)
+      遶翫・TickSnapshot       (clean L1/L2 snapshot, up to 5 price levels)
+      遶翫・KabuSignalStack    (OBI / LOB-OFI / Tape-OFI / momentum / microprice tilt /
                             VWAP deviation / full-depth book imbalance)
-      竊・KabuSignalStrategy (VeighNa CtaTemplate: state machine, order tracking, risk)
+      遶翫・KabuSignalStrategy (VeighNa CtaTemplate: state machine, order tracking, risk)
 
 Verified against official sources (as of 2025):
-  - TSE 蜻ｼ蛟､蜊倅ｽ・ JPX standard domestic equity tick size table (迴ｾ迚ｩ譬ｪ蠑・
-    ETF/REIT/TOPIX500 constituents may use different tables 窶・verify before live use.
-  - Trading hours: 09:00窶・1:30 (蜑榊ｴ) / 12:30窶・5:30 (蠕悟ｴ), orders accepted from 08:00
+  - TSE 陷ｻ・ｼ陋滂ｽ､陷雁・ｽｽ繝ｻ JPX standard domestic equity tick size table (霑ｴ・ｾ霑夲ｽｩ隴ｬ・ｪ陟代・
+    ETF/REIT/TOPIX500 constituents may use different tables 遯ｶ繝ｻverify before live use.
+  - Trading hours: 09:00遯ｶ繝ｻ1:30 (陷第ｦ奇｣ｰ・ｴ) / 12:30遯ｶ繝ｻ5:30 (陟墓ぁ・ｰ・ｴ), orders accepted from 08:00
   - kabu Station API: BestBid/BestAsk field names may be reversed vs. industry convention.
     Set reverse_bid_ask=True if your VeighNa gateway does not normalise these fields.
-  - Commission: kabu offers multiple fee plans (螳夐｡・驛ｽ蠎ｦ). Default parameters use the
-    ad-valorem 驛ｽ蠎ｦ model (迚・％ 0.385% 遞手ｾｼ, min ﾂ･55). Always confirm against your
+  - Commission: kabu offers multiple fee plans (陞ｳ螟撰ｽ｡繝ｻ鬩幢ｽｽ陟趣ｽｦ). Default parameters use the
+    ad-valorem 鬩幢ｽｽ陟趣ｽｦ model (霑壹・・・0.385% 驕樊焔・ｾ・ｼ, min ・ゑｽ･55). Always confirm against your
     actual account plan before live trading.
 """
 from __future__ import annotations
@@ -51,7 +51,7 @@ class ZNormalizer:
     to zero mean / unit variance.  Returns 0.0 during the initial warm-up
     period (< 10 samples) to avoid noisy early readings.
 
-    Reference: signals.md ﾂｧ8
+    Reference: signals.md ・ゑｽｧ8
     """
 
     def __init__(self, lookback: int = 100) -> None:
@@ -75,7 +75,7 @@ class FlowFlipDetector:
     a row (alternating buy/sell) it signals that momentum is exhausted and the
     current trend is likely to stall or reverse.
 
-    Reference: signals.md ﾂｧ7
+    Reference: signals.md ・ゑｽｧ7
     """
 
     def __init__(self, flip_threshold: int = 3) -> None:
@@ -111,13 +111,13 @@ class FlowFlipDetector:
 class TradeRecord:
     """Immutable record of one completed round-trip trade.
 
-    Reference: risk.md ﾂｧ2
+    Reference: risk.md ・ゑｽｧ2
     """
     entry_price: float
     exit_price:  float
     volume:      float
     direction:   int         # +1 = LONG, -1 = SHORT
-    commission:  float       # total round-trip commission (ﾂ･)
+    commission:  float       # total round-trip commission (・ゑｽ･)
     entry_time:  datetime
     exit_time:   datetime
     exit_reason: str         # "TP" / "SL" / "TIMEOUT" / "SIGNAL_FLIP" / "TRAILING" / "FAST_LOSS"
@@ -138,7 +138,7 @@ class TradeRecord:
 class PnLTracker:
     """Accumulates TradeRecords and computes performance statistics.
 
-    Reference: risk.md ﾂｧ2
+    Reference: risk.md ・ゑｽｧ2
     """
 
     def __init__(self) -> None:
@@ -188,11 +188,11 @@ class OrderState(Enum):
     """Strategy-level order lifecycle state.
 
     Transitions:
-      IDLE 竊・PENDING_OPEN   : entry order sent
-      PENDING_OPEN 竊・OPEN   : on_trade (opening fill received)
-      OPEN 竊・PENDING_CLOSE  : exit order sent
-      PENDING_CLOSE 竊・IDLE  : on_trade (closing fill received)
-      any 竊・IDLE            : cancel_all + reset (emergency / cancelled order)
+      IDLE 遶翫・PENDING_OPEN   : entry order sent
+      PENDING_OPEN 遶翫・OPEN   : on_trade (opening fill received)
+      OPEN 遶翫・PENDING_CLOSE  : exit order sent
+      PENDING_CLOSE 遶翫・IDLE  : on_trade (closing fill received)
+      any 遶翫・IDLE            : cancel_all + reset (emergency / cancelled order)
     """
     IDLE          = "idle"
     PENDING_OPEN  = "pending_open"
@@ -201,14 +201,14 @@ class OrderState(Enum):
 
 
 # ---------------------------------------------------------------------------
-# TSE tick size (蜻ｼ蛟､蜊倅ｽ・ 窶・standard domestic equity (迴ｾ迚ｩ譬ｪ蠑・
+# TSE tick size (陷ｻ・ｼ陋滂ｽ､陷雁・ｽｽ繝ｻ 遯ｶ繝ｻstandard domestic equity (霑ｴ・ｾ霑夲ｽｩ隴ｬ・ｪ陟代・
 # NOTE: ETF / REIT / TOPIX500 constituents may differ; verify with JPX circulars.
 # ---------------------------------------------------------------------------
 
 def get_tse_pricetick(price: float) -> float:
     """Return the minimum price increment for a standard TSE equity.
 
-    Based on JPX 蜻ｼ蛟､蜊倅ｽ・table for domestic equities (Prime / Standard / Growth markets).
+    Based on JPX 陷ｻ・ｼ陋滂ｽ､陷雁・ｽｽ繝ｻtable for domestic equities (Prime / Standard / Growth markets).
     Always verify against the latest JPX announcement before live use.
     """
     if price <= 0:
@@ -229,15 +229,15 @@ def get_tse_pricetick(price: float) -> float:
 
 
 # ---------------------------------------------------------------------------
-# Adapter layer 窶・field mapping + optional bid/ask reversal + sanity check
+# Adapter layer 遯ｶ繝ｻfield mapping + optional bid/ask reversal + sanity check
 # ---------------------------------------------------------------------------
 
 class KabuTickAdapter:
     """Extract and normalise a TickSnapshot from a VeighNa TickData object.
 
     kabu Station API field naming differs from financial industry convention:
-      API field BestBid  竊・actual sell-side (ask) price
-      API field BestAsk  竊・actual buy-side  (bid) price
+      API field BestBid  遶翫・actual sell-side (ask) price
+      API field BestAsk  遶翫・actual buy-side  (bid) price
 
     If your VeighNa gateway already corrects this mapping (e.g. the
     kabusapi gateway adapter swaps the fields on ingestion), leave
@@ -269,7 +269,7 @@ class KabuTickAdapter:
             bid1, ask1 = raw_bid, raw_ask
 
         # Sanity check: both prices positive, ordered, and spread within bounds
-        # (spread_pct > max_spread_pct filters out 迚ｹ蛻･豌鈴・ / auction special quotes)
+        # (spread_pct > max_spread_pct filters out 霑夲ｽｹ陋ｻ・･雎碁斡繝ｻ / auction special quotes)
         if bid1 <= 0.0 or ask1 <= 0.0 or bid1 >= ask1:
             return None
         spread_pct = (ask1 - bid1) / max(bid1, 1e-9)
@@ -379,12 +379,12 @@ class SignalConfig:
     w_book_depth: float = 0.5        # Full-depth book imbalance weight
 
     # VWAP signal thresholds
-    vwap_long: float = 0.2           # price below VWAP by this fraction 竊・long alpha
-    vwap_short: float = 0.2          # price above VWAP by this fraction 竊・short alpha
+    vwap_long: float = 0.2           # price below VWAP by this fraction 遶翫・long alpha
+    vwap_short: float = 0.2          # price above VWAP by this fraction 遶翫・short alpha
 
     # Book depth signal thresholds
-    book_depth_long: float = 0.15    # book_depth_ratio above this 竊・long alpha
-    book_depth_short: float = 0.15   # book_depth_ratio below -this 竊・short alpha
+    book_depth_long: float = 0.15    # book_depth_ratio above this 遶翫・long alpha
+    book_depth_short: float = 0.15   # book_depth_ratio below -this 遶翫・short alpha
     book_depth_levels: int = 10      # number of L2 levels to aggregate
 
     # Entry thresholds
@@ -406,7 +406,7 @@ class SignalConfig:
 
     # Adapter
     reverse_bid_ask: bool = False         # Set True if gateway passes raw kabu field names
-    max_spread_pct:  float = 0.05         # reject ticks where spread > 5% of bid (迚ｹ蛻･豌鈴・ filter)
+    max_spread_pct:  float = 0.05         # reject ticks where spread > 5% of bid (霑夲ｽｹ陋ｻ・･雎碁斡繝ｻ filter)
 
     # Auto tick size
     auto_pricetick: bool = False
@@ -433,7 +433,7 @@ class TickSnapshot:
     asks: List[Tuple[float, float]]
     last_price: float = 0.0
     volume: float = 0.0
-    turnover: float = 0.0      # cumulative session turnover (ﾂ･) 窶・used for VWAP calculation
+    turnover: float = 0.0      # cumulative session turnover (・ゑｽ･) 遯ｶ繝ｻused for VWAP calculation
     pricetick: float = 1.0
 
     @property
@@ -458,8 +458,8 @@ class TickSnapshot:
         """Microprice displacement from mid, normalised by half-spread.
 
         Returns a value in approximately [-1, +1]:
-          +1 竊・all volume on buy side (strong upward pressure)
-          -1 竊・all volume on sell side (strong downward pressure)
+          +1 遶翫・all volume on buy side (strong upward pressure)
+          -1 遶翫・all volume on sell side (strong downward pressure)
         """
         half_spread = (self.ask1 - self.bid1) / 2.0
         if half_spread <= 0.0:
@@ -479,8 +479,8 @@ def calc_weighted_obi(
     """Weighted order book imbalance across multiple price levels.
 
     Returns a value in [-1, +1]:
-      +1  竊・strong buy-side pressure (bids dominate)
-      -1  竊・strong sell-side pressure (asks dominate)
+      +1  遶翫・strong buy-side pressure (bids dominate)
+      -1  遶翫・strong sell-side pressure (asks dominate)
 
     Weight decay: w_i = 1 / (1 + i), so best level has weight 1.0,
     second level 0.5, third 0.33, etc.
@@ -503,19 +503,19 @@ def calc_lob_ofi_incremental(prev: TickSnapshot, curr: TickSnapshot) -> float:
     """
     # Bid-side contribution
     if curr.bid1 > prev.bid1:
-        bid_ofi = curr.bid_vol1           # Higher bid appeared 竊・buy pressure added
+        bid_ofi = curr.bid_vol1           # Higher bid appeared 遶翫・buy pressure added
     elif curr.bid1 == prev.bid1:
         bid_ofi = curr.bid_vol1 - prev.bid_vol1
     else:
-        bid_ofi = -prev.bid_vol1          # Bid level dropped 竊・buy pressure removed
+        bid_ofi = -prev.bid_vol1          # Bid level dropped 遶翫・buy pressure removed
 
     # Ask-side contribution
     if curr.ask1 < prev.ask1:
-        ask_ofi = -curr.ask_vol1          # Lower ask appeared 竊・sell pressure added
+        ask_ofi = -curr.ask_vol1          # Lower ask appeared 遶翫・sell pressure added
     elif curr.ask1 == prev.ask1:
         ask_ofi = -(curr.ask_vol1 - prev.ask_vol1)
     else:
-        ask_ofi = prev.ask_vol1           # Ask level rose 竊・sell pressure removed
+        ask_ofi = prev.ask_vol1           # Ask level rose 遶翫・sell pressure removed
 
     return bid_ofi + ask_ofi
 
@@ -529,7 +529,7 @@ def calc_tape_aggressor(
     """Classify a trade as buyer-initiated (+1), seller-initiated (-1), or ambiguous (0).
 
     Uses the Lee-Ready (1991) algorithm:
-      1. Quote rule: trade at or above ask 竊・buy; at or below bid 竊・sell.
+      1. Quote rule: trade at or above ask 遶翫・buy; at or below bid 遶翫・sell.
       2. Tick rule (fallback for mid-spread prints): compare to previous trade.
     """
     if trade_price >= ask:
@@ -552,12 +552,12 @@ def calc_book_depth_ratio(
     """Unweighted total book imbalance across all depth levels.
 
     Complements ``calc_weighted_obi`` (which decays weight with depth) by
-    capturing large orders resting in deep levels 窶・often a sign of
+    capturing large orders resting in deep levels 遯ｶ繝ｻoften a sign of
     institutional intent that doesn't yet appear at the touch.
 
     Returns a value in [-1, +1]:
-      +1  竊・all visible depth is on the bid side (strong buying interest)
-      -1  竊・all visible depth is on the ask side (strong selling interest)
+      +1  遶翫・all visible depth is on the bid side (strong buying interest)
+      -1  遶翫・all visible depth is on the ask side (strong selling interest)
     """
     bid_total = sum(s for _, s in bids[:levels])
     ask_total = sum(s for _, s in asks[:levels])
@@ -573,19 +573,19 @@ class KabuSignalStack:
     """Multi-signal microstructure engine for TSE tick-by-tick scalping.
 
     Signals computed each tick:
-      obi             窶・weighted multi-level order book imbalance
-      microprice_tilt 窶・microprice displacement from mid (half-spread normalised)
-      lob_ofi         窶・incremental best-level order flow imbalance
-      tape_ofi        窶・aggressor-classified volume imbalance (rolling window)
-      momentum        窶・microprice relative to rolling mean
+      obi             遯ｶ繝ｻweighted multi-level order book imbalance
+      microprice_tilt 遯ｶ繝ｻmicroprice displacement from mid (half-spread normalised)
+      lob_ofi         遯ｶ繝ｻincremental best-level order flow imbalance
+      tape_ofi        遯ｶ繝ｻaggressor-classified volume imbalance (rolling window)
+      momentum        遯ｶ繝ｻmicroprice relative to rolling mean
 
     Public interface:
-      on_tick(tick)          竊・Optional[TickSnapshot]   (uses internal adapter)
-      on_snapshot(snap)      竊・TickSnapshot             (for externally built snaps)
-      can_open_long(skew)    竊・bool
-      can_open_short(skew)   竊・bool
-      should_exit_long()     竊・bool
-      should_exit_short()    竊・bool
+      on_tick(tick)          遶翫・Optional[TickSnapshot]   (uses internal adapter)
+      on_snapshot(snap)      遶翫・TickSnapshot             (for externally built snaps)
+      can_open_long(skew)    遶翫・bool
+      can_open_short(skew)   遶翫・bool
+      should_exit_long()     遶翫・bool
+      should_exit_short()    遶翫・bool
     """
 
     def __init__(self, config: SignalConfig, pricetick: float = 1.0) -> None:
@@ -888,9 +888,9 @@ class KabuSignalStack:
     def _update_regime(self, snap: TickSnapshot) -> None:
         """Detect market regime using lag-1 sign autocorrelation of returns.
 
-        ``sign_autocorr > +threshold``  竊・TREND    (returns tend to continue)
-        ``sign_autocorr < -threshold``  竊・REVERSION (returns tend to reverse)
-        otherwise                        竊・NOISE
+        ``sign_autocorr > +threshold``  遶翫・TREND    (returns tend to continue)
+        ``sign_autocorr < -threshold``  遶翫・REVERSION (returns tend to reverse)
+        otherwise                        遶翫・NOISE
 
         Volatility gate (noise_vol_threshold) is applied first: if the
         price is moving too fast the signal-to-noise ratio is poor.
@@ -911,7 +911,7 @@ class KabuSignalStack:
             self.regime = "REVERSION"
             return
 
-        # Volatility gate 窶・block noisy high-vol periods
+        # Volatility gate 遯ｶ繝ｻblock noisy high-vol periods
         mean_ret = sum(rets) / len(rets)
         var = sum((r - mean_ret) ** 2 for r in rets) / len(rets)
         vol_ticks = math.sqrt(max(var, 0.0)) * snap.mid / max(self.pricetick, 1e-9)
@@ -936,14 +936,14 @@ class KabuSignalStack:
     def _update_vwap_signal(self, snap: TickSnapshot) -> None:
         """Compute session VWAP from cumulative turnover/volume increments.
 
-        Price below VWAP 竊・positive signal (mean-reversion buy pressure).
-        Price above VWAP 竊・negative signal (sell pressure).
-        Normalised to [-1, +1] using a ﾂｱ3 tick window.
+        Price below VWAP 遶翫・positive signal (mean-reversion buy pressure).
+        Price above VWAP 遶翫・negative signal (sell pressure).
+        Normalised to [-1, +1] using a ・ゑｽｱ3 tick window.
         VWAP accumulator resets each new calendar day.
         """
         date_str = snap.dt.strftime("%Y%m%d")
         if date_str != self._sess_date:
-            # New session 窶・reset accumulators
+            # New session 遯ｶ繝ｻreset accumulators
             self._sess_date = date_str
             self._sess_vol = 0.0
             self._sess_turn = 0.0
@@ -959,7 +959,7 @@ class KabuSignalStack:
             return
 
         vwap = self._sess_turn / self._sess_vol
-        # Negative displacement = price below VWAP 竊・positive (buy) signal
+        # Negative displacement = price below VWAP 遶翫・positive (buy) signal
         raw_ticks = (vwap - snap.mid) / max(self.pricetick, 1e-9)
         self.vwap_signal = max(-1.0, min(1.0, raw_ticks / 3.0))
 
@@ -1099,7 +1099,7 @@ if _VNPY_AVAILABLE:
         """VeighNa CTA strategy wrapping KabuSignalStack.
 
         Order lifecycle (state machine):
-          IDLE 竊・PENDING_OPEN 竊・OPEN 竊・PENDING_CLOSE 竊・IDLE
+          IDLE 遶翫・PENDING_OPEN 遶翫・OPEN 遶翫・PENDING_CLOSE 遶翫・IDLE
 
         The state machine is the primary guard against duplicate orders:
         no new entry is allowed unless the state is IDLE.
@@ -1111,7 +1111,7 @@ if _VNPY_AVAILABLE:
           4. Timeout          (elapsed >= max_hold_seconds, unconditional)
 
         PnL uses actual fill prices from on_trade callbacks, not pre-order estimates.
-        Commission uses kabu's ad-valorem model: max(commission_min, rate ﾃ・value).
+        Commission uses kabu's ad-valorem model: max(commission_min, rate ・・・value).
         """
 
         author = "KabuSignalStack v3"
@@ -1132,10 +1132,10 @@ if _VNPY_AVAILABLE:
         reverse_bid_ask: bool = False   # Set True if kabu gateway passes raw field names
         auto_pricetick: bool = True
 
-        # Commission 窶・kabu ad-valorem model (驛ｽ蠎ｦ謇区焚譁・
+        # Commission 遯ｶ繝ｻkabu ad-valorem model (鬩幢ｽｽ陟趣ｽｦ隰・玄辟夊ｭ√・
         # IMPORTANT: confirm against your actual account plan before live trading.
-        commission_rate: float = 0.00385   # 迚・％ 0.385% 遞手ｾｼ
-        commission_min: float = 55.0       # 譛菴取焔謨ｰ譁・ﾂ･55 遞手ｾｼ
+        commission_rate: float = 0.00385   # 霑壹・・・0.385% 驕樊焔・ｾ・ｼ
+        commission_min: float = 55.0       # 隴崢闖ｴ蜿也・隰ｨ・ｰ隴√・・ゑｽ･55 驕樊焔・ｾ・ｼ
 
         # Exit parameters
         profit_ticks: float = 3.0
@@ -1175,7 +1175,7 @@ if _VNPY_AVAILABLE:
         # --- v3 parameters ---
         # Execution quality
         maker_escape_timeout_sec: float = 1.5    # cancel stale MAKER order and re-enter as TAKER
-        max_impact_pct: float = 0.5              # reject entry if vol > this ﾃ・best-level size
+        max_impact_pct: float = 0.5              # reject entry if vol > this ・・・best-level size
 
         # Risk completeness
         fast_loss_ticks: float = 1.5             # fast-loss circuit breaker: ticks lost
@@ -1197,7 +1197,7 @@ if _VNPY_AVAILABLE:
 
         # MAKER mode override
         force_maker_mode: bool = False           # When True: always enter at bid(long)/ask(short),
-                                                 # exit at ask(long)/bid(short) 窶・captures the spread.
+                                                 # exit at ask(long)/bid(short) 遯ｶ繝ｻcaptures the spread.
                                                  # When False: signal engine decides MAKER vs TAKER.
 
         # Auto-TP on fill
@@ -1299,7 +1299,7 @@ if _VNPY_AVAILABLE:
             self._order_state: OrderState = OrderState.IDLE
             self._active_orderids: List[str] = []
 
-            # Entry tracking 窶・populated from actual fill in on_trade
+            # Entry tracking 遯ｶ繝ｻpopulated from actual fill in on_trade
             self._entry_fill_price: float = 0.0
             self._entry_fill_volume: float = 0.0
             self._entry_time: Optional[datetime] = None
@@ -1364,18 +1364,15 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         def on_start(self) -> None:
-            # ----------------------------------------------------------------
-            # Step 1: 蠑ｺ蛻ｶ隶｢髦・｡梧ュ・郁ｧ｣蜀ｳ蜷育ｺｦ譛ｪ豕ｨ蜀・/ CTA engine 鮑｡逕溯寞髣ｮ鬚假ｼ・            #
-            # VeighNa CTA engine 逧・init_strategy() 蜿ｪ譛牙惠蜷育ｺｦ蟾ｲ鬚・ｳｨ蜀梧慮謇堺ｼ・            # 隹・畑 gateway.subscribe()縲り凶蜷育ｺｦ荳榊惠 KABU_STOCK_CONTRACTS・・            # 隶｢髦・撕鮟伜､ｱ雍･・悟ｯｼ閾ｴ"蟋疲汚螟ｱ雍･・梧伽荳榊芦蜷育ｺｦ"縲・            #
-            # 霑咎㈹逶ｴ謗･隹・畑 main_engine.subscribe()・瑚ｮｩ gateway 蜉ｨ諤∵ｳｨ蜀悟粋郤ｦ
-            # 蟷ｶ蟒ｺ遶・WebSocket 謗ｨ騾∬ｿ樊磁・梧裏髴 UI 謇句勘霎灘・閧｡逾ｨ莉｣遐√・            # ----------------------------------------------------------------
+            # Step 1: force subscribe once at start (helps after gateway reconnect).
             self._force_subscribe()
 
-            # Step 2: 隸ｻ蜿・pricetick・亥粋郤ｦ蟾ｲ豕ｨ蜀悟錘謇崎・蜿門芦豁｣遑ｮ蛟ｼ・・            pt = self.get_pricetick()
+            # Step 2: load pricetick from contract if available.
+            pt = self.get_pricetick()
             if pt and pt > 0:
                 self.price_tick = float(pt)
 
-            # Step 3: 驥榊ｻｺ菫｡蜿ｷ蠑墓梼
+            # Step 3: rebuild signal engine from strategy parameters.
             cfg = SignalConfig(
                 max_spread_ticks=self.max_spread_ticks,
                 min_best_volume=self.min_best_volume,
@@ -1396,44 +1393,35 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         def _force_subscribe(self) -> None:
-            """蠑ｺ蛻ｶ蜷・gateway 蜿鷹∬ｮ｢髦・ｯｷ豎ゑｼ檎｡ｮ菫晏粋郤ｦ豕ｨ蜀悟柱 WS 謗ｨ騾∝ｻｺ遶九・
-            隗｣蜀ｳ霍ｯ蠕・ｼ・              on_start 竊・_force_subscribe
-                竊・main_engine.subscribe(req, gateway_name)
-                竊・gateway.subscribe(req)          竊・闍･蜷育ｺｦ譛ｪ豕ｨ蜀悟・蜉ｨ諤∝・蟒ｺ
-                竊・gateway.ws_api.subscribe(req)   竊・蟒ｺ遶・WebSocket 謗ｨ騾・
-            莨伜・菴ｿ逕ｨ蟾ｲ譛牙粋郤ｦ逧・gateway_name・幄凶蜷育ｺｦ蟆壻ｸ榊ｭ伜惠蛻咎″蜴・園譛牙ｷｲ霑樊磁
-            gateway 蟆晁ｯ戊ｮ｢髦・ｼ磯ら畑莠朱ｦ匁ｬ｡蜷ｯ蜉ｨ縲∵眠蜩∫ｧ肴磁蜈･遲牙惻譎ｯ・峨・            """
+            """Best-effort subscribe using the known contract gateway first."""
             try:
                 parts = self.vt_symbol.split(".", 1)
                 if len(parts) != 2:
                     return
+
                 symbol_str, exchange_str = parts
-                # 菴ｿ逕ｨ蟾ｲ蟇ｼ蜈･逧・Direction/Status 謇蝨ｨ vnpy.trader.constant 讓｡蝮・                from vnpy.trader.constant import Exchange as _Ex
+                from vnpy.trader.constant import Exchange as _Ex
                 from vnpy.trader.object import SubscribeRequest as _SR
+
                 ex = _Ex(exchange_str)
                 req = _SR(symbol=symbol_str, exchange=ex)
-
                 main_engine = self.cta_engine.main_engine
 
-                # 莨伜・莉主ｷｲ譛牙粋郤ｦ蜿・gateway_name・磯㍾蜷ｯ扈ｭ逕ｨ蟾ｲ遏･蜷育ｺｦ・・                contract = main_engine.get_contract(self.vt_symbol)
+                contract = main_engine.get_contract(self.vt_symbol)
                 if contract and getattr(contract, "gateway_name", None):
                     main_engine.subscribe(req, contract.gateway_name)
-                    self.write_log(f"陦梧ュ隶｢髦・ {self.vt_symbol} 竊・{contract.gateway_name}")
+                    self.write_log(f"Force subscribe {self.vt_symbol} -> {contract.gateway_name}")
                     return
 
-                # 蜷育ｺｦ譛ｪ豕ｨ蜀梧慮・夐蝉ｸ蟆晁ｯ募ｷｲ霑樊磁逧・gateway
                 gateways = getattr(main_engine, "gateways", {})
                 for gw_name in gateways:
                     main_engine.subscribe(req, gw_name)
-                    self.write_log(
-                        f"陦梧ュ隶｢髦・蜉ｨ諤∵ｳｨ蜀・: {self.vt_symbol} 竊・{gw_name}"
-                    )
+                    self.write_log(f"Force subscribe fallback {self.vt_symbol} -> {gw_name}")
                     return
 
-                self.write_log(f"[WARN] 譌蜿ｯ逕ｨ gateway・瑚｡梧ュ隶｢髦・､ｱ雍･: {self.vt_symbol}")
-
+                self.write_log(f"[WARN] No gateway found for force_subscribe: {self.vt_symbol}")
             except Exception as e:
-                self.write_log(f"[WARN] _force_subscribe 蠑ょｸｸ: {e}")
+                self.write_log(f"[WARN] _force_subscribe error: {e}")
 
         def on_stop(self) -> None:
             self._rl_cancel_all(datetime.now())
@@ -1467,7 +1455,7 @@ if _VNPY_AVAILABLE:
             self._check_pending_timeouts(tick_dt, snap)
             self._try_retry_pending_auto_tp(tick_dt)
 
-            # 2. State machine guard 窶・if not IDLE, only manage open position
+            # 2. State machine guard 遯ｶ繝ｻif not IDLE, only manage open position
             if self._order_state != OrderState.IDLE:
                 if self._order_state == OrderState.OPEN:
                     if not self._is_trading_allowed:
@@ -1701,7 +1689,7 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         # ------------------------------------------------------------------
-        # Auto-TP helper 窶・called immediately after open fill in on_trade()
+        # Auto-TP helper 遯ｶ繝ｻcalled immediately after open fill in on_trade()
         # ------------------------------------------------------------------
 
         def _try_place_auto_tp(self, now: datetime) -> None:
@@ -1908,7 +1896,7 @@ if _VNPY_AVAILABLE:
             elapsed = (tick_dt - self._entry_time).total_seconds()
 
             # ----------------------------------------------------------------
-            # C1: Fast loss circuit breaker 窶・aggressive immediate exit if
+            # C1: Fast loss circuit breaker 遯ｶ繝ｻaggressive immediate exit if
             # the position loses fast_loss_ticks within fast_loss_sec of entry.
             # Indicates we entered into a strongly directional move against us.
             # Disabled when hold_if_loss=True (never cut on fast adverse move).
@@ -1933,14 +1921,14 @@ if _VNPY_AVAILABLE:
                         self._state_since = tick_dt
                         self.order_state = OrderState.PENDING_CLOSE.value
                         self.write_log(
-                            f"[FAST LOSS] {fast_pnl:.1f}ticks in {elapsed:.1f}s 竊・aggressive exit"
+                            f"[FAST LOSS] {fast_pnl:.1f}ticks in {elapsed:.1f}s 遶翫・aggressive exit"
                         )
                     return
 
             # ----------------------------------------------------------------
             # Normal exit logic with two-tier pricing (B2):
-            #   窶｢ Urgent exits (stop-loss / timeout) 竊・aggressive price (bid1 / ask1)
-            #   窶｢ Take-profit / signal exits         竊・gentle limit (bid1-pt / ask1+pt)
+            #   遯ｶ・｢ Urgent exits (stop-loss / timeout) 遶翫・aggressive price (bid1 / ask1)
+            #   遯ｶ・｢ Take-profit / signal exits         遶翫・gentle limit (bid1-pt / ask1+pt)
             # ----------------------------------------------------------------
             if self.pos > 0:
                 pnl_ticks = (snap.bid1 - self._entry_fill_price) / pt
@@ -1974,7 +1962,7 @@ if _VNPY_AVAILABLE:
                         # Aggressive taker: sell at best bid immediately
                         exit_price = snap.bid1
                     elif self._entry_mode == "MAKER":
-                        # MAKER exit: post sell at ask 竊・capture spread (鬮倅ｻｷ蜿肴ｸ・
+                        # MAKER exit: post sell at ask 遶翫・capture spread (鬯ｮ蛟・ｽｻ・ｷ陷ｿ閧ｴ・ｸ繝ｻ
                         exit_price = snap.ask1
                     else:
                         # TAKER exit fallback: cross the bid
@@ -2018,7 +2006,7 @@ if _VNPY_AVAILABLE:
                         # Aggressive taker: cover at best ask immediately
                         exit_price = snap.ask1
                     elif self._entry_mode == "MAKER":
-                        # MAKER exit: post buy at bid 竊・capture spread (菴惹ｻｷ蜿肴ｸ・
+                        # MAKER exit: post buy at bid 遶翫・capture spread (闖ｴ諠ｹ・ｻ・ｷ陷ｿ閧ｴ・ｸ繝ｻ
                         exit_price = snap.bid1
                     else:
                         # TAKER exit fallback: cross the ask
@@ -2055,10 +2043,10 @@ if _VNPY_AVAILABLE:
         # ------------------------------------------------------------------
 
         def _calc_commission(self, price: float, volume: float) -> float:
-            """One-way commission: max(min_fee, rate ﾃ・trade_value).
+            """One-way commission: max(min_fee, rate ・・・trade_value).
 
             IMPORTANT: verify commission_rate and commission_min against your
-            actual kabu account plan (螳夐｡・vs 驛ｽ蠎ｦ) before live trading.
+            actual kabu account plan (陞ｳ螟撰ｽ｡繝ｻvs 鬩幢ｽｽ陟趣ｽｦ) before live trading.
             """
             trade_value = price * volume
             return max(self.commission_min, trade_value * self.commission_rate)
@@ -2169,7 +2157,7 @@ if _VNPY_AVAILABLE:
                 if signal_gone:
                     self.write_log(
                         f"[SMART CANCEL] Signal flipped during PENDING_OPEN "
-                        f"({self._entry_direction}) 竊・cancel entry immediately"
+                        f"({self._entry_direction}) 遶翫・cancel entry immediately"
                     )
                     sent = self._rl_cancel_all(now)
                     if sent:
@@ -2361,7 +2349,7 @@ if _VNPY_AVAILABLE:
                 if self.sig.edge_score > -required:
                     return False
 
-            # B3: Market impact check 窶・reject if our order would consume more than
+            # B3: Market impact check 遯ｶ繝ｻreject if our order would consume more than
             # max_impact_pct of the best-level size (signals poor liquidity for our size).
             if vol > 0 and self.max_impact_pct > 0:
                 best_vol = snap.ask_vol1 if direction > 0 else snap.bid_vol1
@@ -2559,5 +2547,6 @@ if _VNPY_AVAILABLE:
             self._signal_pending_dt = None
             self._clear_pending_auto_tp()
             self._stale_force_flatten_pending = False
+
 
 

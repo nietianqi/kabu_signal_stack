@@ -248,9 +248,17 @@ class KabuTickAdapter:
     receives normalised data where bid < ask.
     """
 
-    def __init__(self, reverse_bid_ask: bool = False, max_spread_pct: float = 0.05) -> None:
+    def __init__(
+        self,
+        reverse_bid_ask: bool = False,
+        max_spread_pct: float = 0.05,
+        auto_fix_negative_spread: bool = True,
+        auto_fix_negative_spread_max_ticks: float = 3.0,
+    ) -> None:
         self.reverse_bid_ask = reverse_bid_ask
         self.max_spread_pct  = max_spread_pct
+        self.auto_fix_negative_spread = auto_fix_negative_spread
+        self.auto_fix_negative_spread_max_ticks = max(0.5, float(auto_fix_negative_spread_max_ticks))
 
     def extract(self, tick, pricetick: float = 1.0) -> Optional["TickSnapshot"]:
         """Return a normalised TickSnapshot, or None if the tick fails sanity checks."""
@@ -258,20 +266,36 @@ class KabuTickAdapter:
         def _f(attr: str) -> float:
             return float(getattr(tick, attr, 0.0) or 0.0)
 
+        def _apply_swap(raw_bid: float, raw_ask: float, swap: bool) -> Tuple[float, float]:
+            return (raw_ask, raw_bid) if swap else (raw_bid, raw_ask)
+
         # Read raw L1 fields
         raw_bid = _f("bid_price_1")
         raw_ask = _f("ask_price_1")
 
-        # Apply optional field swap
-        if self.reverse_bid_ask:
-            bid1, ask1 = raw_ask, raw_bid
-        else:
-            bid1, ask1 = raw_bid, raw_ask
+        # Apply configured field mapping first.
+        use_swap = self.reverse_bid_ask
+        bid1, ask1 = _apply_swap(raw_bid, raw_ask, use_swap)
 
-        # Sanity check: both prices positive, ordered, and spread within bounds
-        # (spread_pct > max_spread_pct filters out 霑夲ｽｹ陋ｻ・･雎碁斡繝ｻ / auction special quotes)
-        if bid1 <= 0.0 or ask1 <= 0.0 or bid1 >= ask1:
+        # Basic sanity: prices must be positive.
+        if bid1 <= 0.0 or ask1 <= 0.0:
             return None
+
+        # Auto-fix path (inspired by optimized_new):
+        # if we see negative spread, try toggling side mapping for this tick.
+        if bid1 >= ask1 and self.auto_fix_negative_spread:
+            alt_swap = not use_swap
+            alt_bid, alt_ask = _apply_swap(raw_bid, raw_ask, alt_swap)
+            if alt_bid > 0.0 and alt_ask > alt_bid:
+                spread_ticks = (alt_ask - alt_bid) / max(pricetick, 1e-9)
+                if spread_ticks <= self.auto_fix_negative_spread_max_ticks:
+                    use_swap = alt_swap
+                    bid1, ask1 = alt_bid, alt_ask
+
+        # Still invalid after auto-fix attempt.
+        if bid1 >= ask1:
+            return None
+
         spread_pct = (ask1 - bid1) / max(bid1, 1e-9)
         if spread_pct > self.max_spread_pct:
             return None
@@ -284,8 +308,8 @@ class KabuTickAdapter:
             bv = _f(f"bid_volume_{i}")
             ap = _f(f"ask_price_{i}")
             av = _f(f"ask_volume_{i}")
-            # Apply reversal to L2 levels as well
-            if self.reverse_bid_ask:
+            # Apply final side mapping to L2 levels as well.
+            if use_swap:
                 bp, ap = ap, bp
                 bv, av = av, bv
             if bp > 0.0 and bv > 0.0:
@@ -301,12 +325,17 @@ class KabuTickAdapter:
         if not isinstance(dt, datetime):
             dt = datetime.now()
 
+        bid_vol1 = _f("bid_volume_1")
+        ask_vol1 = _f("ask_volume_1")
+        if use_swap:
+            bid_vol1, ask_vol1 = ask_vol1, bid_vol1
+
         return TickSnapshot(
             dt=dt,
             bid1=bid1,
             ask1=ask1,
-            bid_vol1=bids[0][1] if bids else _f("bid_volume_1"),
-            ask_vol1=asks[0][1] if asks else _f("ask_volume_1"),
+            bid_vol1=bids[0][1] if bids else bid_vol1,
+            ask_vol1=asks[0][1] if asks else ask_vol1,
             bids=bids,
             asks=asks,
             last_price=_f("last_price"),
@@ -407,6 +436,8 @@ class SignalConfig:
     # Adapter
     reverse_bid_ask: bool = False         # Set True if gateway passes raw kabu field names
     max_spread_pct:  float = 0.05         # reject ticks where spread > 5% of bid (霑夲ｽｹ陋ｻ・･雎碁斡繝ｻ filter)
+    auto_fix_negative_spread: bool = True
+    auto_fix_negative_spread_max_ticks: float = 3.0
 
     # Auto tick size
     auto_pricetick: bool = False
@@ -591,7 +622,12 @@ class KabuSignalStack:
     def __init__(self, config: SignalConfig, pricetick: float = 1.0) -> None:
         self.cfg = config
         self.pricetick = max(1e-9, float(pricetick or 1.0))
-        self._adapter = KabuTickAdapter(config.reverse_bid_ask, config.max_spread_pct)
+        self._adapter = KabuTickAdapter(
+            reverse_bid_ask=config.reverse_bid_ask,
+            max_spread_pct=config.max_spread_pct,
+            auto_fix_negative_spread=config.auto_fix_negative_spread,
+            auto_fix_negative_spread_max_ticks=config.auto_fix_negative_spread_max_ticks,
+        )
         self._prev_snap: Optional[TickSnapshot] = None
         self._tick_count: int = 0
 
@@ -1130,6 +1166,8 @@ if _VNPY_AVAILABLE:
 
         # Adapter
         reverse_bid_ask: bool = False   # Set True if kabu gateway passes raw field names
+        auto_fix_negative_spread: bool = True
+        auto_fix_negative_spread_max_ticks: float = 3.0
         auto_pricetick: bool = True
 
         # Commission 遯ｶ繝ｻkabu ad-valorem model (鬩幢ｽｽ陟趣ｽｦ隰・玄辟夊ｭ√・
@@ -1222,7 +1260,7 @@ if _VNPY_AVAILABLE:
             "enable_long", "enable_short",
             "max_spread_ticks", "min_best_volume",
             "obi_levels", "ev_gate_enabled",
-            "reverse_bid_ask", "auto_pricetick",
+            "reverse_bid_ask", "auto_fix_negative_spread", "auto_fix_negative_spread_max_ticks", "auto_pricetick",
             "commission_rate", "commission_min",
             "profit_ticks", "loss_ticks", "max_hold_seconds",
             "open_order_timeout_sec", "close_order_timeout_sec", "taker_exit_extra_ticks",
@@ -1386,6 +1424,8 @@ if _VNPY_AVAILABLE:
                 obi_levels=self.obi_levels,
                 ev_gate_enabled=self.ev_gate_enabled,
                 reverse_bid_ask=self.reverse_bid_ask,
+                auto_fix_negative_spread=self.auto_fix_negative_spread,
+                auto_fix_negative_spread_max_ticks=self.auto_fix_negative_spread_max_ticks,
                 auto_pricetick=self.auto_pricetick,
                 znorm_lookback=self.znorm_lookback,
                 flow_flip_threshold=self.flow_flip_threshold,

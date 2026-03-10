@@ -1314,9 +1314,24 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         def on_start(self) -> None:
+            # ----------------------------------------------------------------
+            # Step 1: 强制订阅行情（解决合约未注册 / CTA engine 鸡生蛋问题）
+            #
+            # VeighNa CTA engine 的 init_strategy() 只有在合约已预注册时才会
+            # 调用 gateway.subscribe()。若合约不在 KABU_STOCK_CONTRACTS，
+            # 订阅静默失败，导致"委托失败，找不到合约"。
+            #
+            # 这里直接调用 main_engine.subscribe()，让 gateway 动态注册合约
+            # 并建立 WebSocket 推送连接，无需 UI 手动输入股票代码。
+            # ----------------------------------------------------------------
+            self._force_subscribe()
+
+            # Step 2: 读取 pricetick（合约已注册后才能取到正确值）
             pt = self.get_pricetick()
             if pt and pt > 0:
                 self.price_tick = float(pt)
+
+            # Step 3: 重建信号引擎
             cfg = SignalConfig(
                 max_spread_ticks=self.max_spread_ticks,
                 min_best_volume=self.min_best_volume,
@@ -1335,6 +1350,52 @@ if _VNPY_AVAILABLE:
                 f"reverse_bid_ask={self.reverse_bid_ask}"
             )
             self.put_event()
+
+        def _force_subscribe(self) -> None:
+            """强制向 gateway 发送订阅请求，确保合约注册和 WS 推送建立。
+
+            解决路径：
+              on_start → _force_subscribe
+                → main_engine.subscribe(req, gateway_name)
+                → gateway.subscribe(req)          ← 若合约未注册则动态创建
+                → gateway.ws_api.subscribe(req)   ← 建立 WebSocket 推送
+
+            优先使用已有合约的 gateway_name；若合约尚不存在则遍历所有已连接
+            gateway 尝试订阅（适用于首次启动、新品种接入等场景）。
+            """
+            try:
+                parts = self.vt_symbol.split(".", 1)
+                if len(parts) != 2:
+                    return
+                symbol_str, exchange_str = parts
+                # 使用已导入的 Direction/Status 所在 vnpy.trader.constant 模块
+                from vnpy.trader.constant import Exchange as _Ex
+                from vnpy.trader.object import SubscribeRequest as _SR
+                ex = _Ex(exchange_str)
+                req = _SR(symbol=symbol_str, exchange=ex)
+
+                main_engine = self.cta_engine.main_engine
+
+                # 优先从已有合约取 gateway_name（重启续用已知合约）
+                contract = main_engine.get_contract(self.vt_symbol)
+                if contract and getattr(contract, "gateway_name", None):
+                    main_engine.subscribe(req, contract.gateway_name)
+                    self.write_log(f"行情订阅: {self.vt_symbol} → {contract.gateway_name}")
+                    return
+
+                # 合约未注册时：逐一尝试已连接的 gateway
+                gateways = getattr(main_engine, "gateways", {})
+                for gw_name in gateways:
+                    main_engine.subscribe(req, gw_name)
+                    self.write_log(
+                        f"行情订阅(动态注册): {self.vt_symbol} → {gw_name}"
+                    )
+                    return
+
+                self.write_log(f"[WARN] 无可用 gateway，行情订阅失败: {self.vt_symbol}")
+
+            except Exception as e:
+                self.write_log(f"[WARN] _force_subscribe 异常: {e}")
 
         def on_stop(self) -> None:
             self._rl_cancel_all(datetime.now())

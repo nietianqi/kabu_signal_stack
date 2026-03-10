@@ -1904,7 +1904,7 @@ if _VNPY_AVAILABLE:
         def _compute_order_volume(self, direction: int) -> int:
             """Dynamic sizing from signal strength and current risk state."""
             base = max(self.min_trade_volume, self.trade_volume)
-            edge_threshold = self.sig.edge_score_long_threshold if direction > 0 else self.sig.edge_score_short_threshold
+            edge_threshold = self.sig.cfg.edge_score_long_threshold if direction > 0 else self.sig.cfg.edge_score_short_threshold
             strength = abs(self.sig.edge_score) / max(1e-9, edge_threshold)
             strength_scale = min(1.8, max(0.6, strength))
 
@@ -1932,11 +1932,11 @@ if _VNPY_AVAILABLE:
 
             spread_extra = max(0.0, snap.spread_ticks - 1.0) * self.spread_edge_penalty
             if direction > 0:
-                required = self.sig.edge_score_long_threshold + spread_extra
+                required = self.sig.cfg.edge_score_long_threshold + spread_extra
                 if self.sig.edge_score < required:
                     return False
             else:
-                required = self.sig.edge_score_short_threshold + spread_extra
+                required = self.sig.cfg.edge_score_short_threshold + spread_extra
                 if self.sig.edge_score > -required:
                     return False
 

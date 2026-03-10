@@ -845,12 +845,15 @@ class KabuSignalStack:
         vol = max(0.0, snap.volume)
         if self._prev_snap is None:
             self._last_total_volume = vol
+            self.flow_flip = False
             return
         delta_vol = max(0.0, vol - self._last_total_volume)
         self._last_total_volume = vol
         if delta_vol <= 0:
             self._expire_tape(now)
             self._compute_tape()
+            # No new prints: clear flip event so it doesn't stay sticky.
+            self.flow_flip = self._flow_flip_det.update(0)
             return
         prev_trade = self._prev_snap.last_price if self._prev_snap else None
         aggr = calc_tape_aggressor(snap.last_price, snap.bid1, snap.ask1, prev_trade)
@@ -1187,6 +1190,25 @@ if _VNPY_AVAILABLE:
         open_min_interval_ms:  float = 100.0     # minimum ms between two consecutive open orders
         close_min_interval_ms: float = 50.0      # minimum ms between two consecutive close orders
 
+        # Hold-through-loss mode
+        hold_if_loss: bool = False               # When True: suppress SL & fast-loss exits;
+                                                 # position exits only on TP/TIMEOUT/TRAILING/SIGNAL_FLIP
+
+        # MAKER mode override
+        force_maker_mode: bool = False           # When True: always enter at bid(long)/ask(short),
+                                                 # exit at ask(long)/bid(short) — captures the spread.
+                                                 # When False: signal engine decides MAKER vs TAKER.
+
+        # Auto-TP on fill
+        auto_tp_on_fill: bool = True             # When True: place limit TP close order immediately
+                                                 # when open fill is confirmed (vs waiting for next tick)
+        auto_tp_ticks: float = 1.0               # TP price offset in ticks from fill price
+                                                 # LONG: fill + auto_tp_ticks*pt; SHORT: fill - auto_tp_ticks*pt
+
+        # Smart cancel for pending open orders
+        smart_cancel_on_flip: bool = True        # When True: cancel PENDING_OPEN order immediately
+                                                 # if the entry signal reverses (no waiting for timeout)
+
         parameters = [
             "trade_volume", "max_position",
             "enable_long", "enable_short",
@@ -1210,6 +1232,10 @@ if _VNPY_AVAILABLE:
             # v4
             "znorm_lookback", "flow_flip_threshold",
             "open_min_interval_ms", "close_min_interval_ms",
+            "hold_if_loss",
+            "force_maker_mode",
+            "auto_tp_on_fill", "auto_tp_ticks",
+            "smart_cancel_on_flip",
         ]
 
         # --- UI-visible variables ---
@@ -1276,6 +1302,8 @@ if _VNPY_AVAILABLE:
             self._close_volume_accum: float = 0.0
             self._max_favorable_ticks: float = 0.0
             self._pending_exit_reason: str = ""   # set in _manage_exit, consumed in on_trade
+            self._maker_escape_pending: bool = False
+            self._last_snap: Optional[TickSnapshot] = None
 
             # v4: separate open/close rate limit timestamps
             self._last_open_order_ts:  Optional[datetime] = None
@@ -1416,6 +1444,7 @@ if _VNPY_AVAILABLE:
             if snap is None:
                 self._maybe_log_bad_tick(tick)
                 return
+            self._last_snap = snap
 
             tick_dt = snap.dt
             self._sync_sig_vars(tick_dt)
@@ -1503,10 +1532,14 @@ if _VNPY_AVAILABLE:
                 self._state_since = trade_dt
                 self.last_entry_price = self._entry_fill_price
                 self.order_state = OrderState.OPEN.value
+                self._maker_escape_pending = False
                 self.write_log(
                     f"FILL OPEN {self._entry_direction} "
                     f"avg={self._entry_fill_price:.1f} vol={self._entry_fill_volume:.0f}"
                 )
+                # Immediately place TP close order on fill (OCO-style)
+                if self.auto_tp_on_fill:
+                    self._place_auto_tp(trade_dt)
 
             elif self._order_state in (OrderState.PENDING_CLOSE, OrderState.OPEN) and is_close_fill:
                 realized_vol = min(trade_volume, max(self._entry_fill_volume, 0.0))
@@ -1567,24 +1600,41 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         def on_order(self, order) -> None:
-            # Detect cancellation or rejection and update state accordingly
-            try:
-                cancelled = order.status in (Status.CANCELLED, Status.REJECTED)
-            except Exception:
-                s = str(getattr(order, "status", "")).lower()
-                cancelled = "cancel" in s or "reject" in s
+            status = getattr(order, "status", None)
+            vt_orderid = getattr(order, "vt_orderid", "")
 
-            if cancelled and order.vt_orderid in self._active_orderids:
-                self._active_orderids.remove(order.vt_orderid)
-                if not self._active_orderids:
-                    if self._order_state == OrderState.PENDING_OPEN:
-                        # Entry order cancelled before fill → back to IDLE
-                        self.write_log(f"Open order cancelled: {order.vt_orderid}")
-                        self._reset_position_state()
-                    elif self._order_state == OrderState.PENDING_CLOSE:
-                        # Exit order cancelled → retry next tick
+            try:
+                is_active = status in (Status.SUBMITTING, Status.NOTTRADED, Status.PARTTRADED)
+                cancelled = status in (Status.CANCELLED, Status.REJECTED)
+            except Exception:
+                s = str(status).lower()
+                is_active = any(x in s for x in ("submit", "nottraded", "parttraded", "partial", "pending"))
+                cancelled = ("cancel" in s) or ("reject" in s)
+
+            # Remove non-active orders (including all-traded) to avoid stale blockers.
+            if vt_orderid in self._active_orderids and not is_active:
+                self._active_orderids.remove(vt_orderid)
+
+            if not self._active_orderids:
+                if self._order_state == OrderState.PENDING_OPEN:
+                    if cancelled and self._entry_fill_volume <= 0:
+                        # Safe MAKER escape: retry only after cancel acknowledgement.
+                        if self._maker_escape_pending and self._retry_maker_escape_as_taker(datetime.now()):
+                            pass
+                        else:
+                            self.write_log(f"Open order cancelled: {vt_orderid}")
+                            self._reset_position_state()
+                    elif self._entry_fill_volume > 0:
+                        # Order finished and at least partial fill exists -> open position state.
+                        self._order_state = OrderState.OPEN
+                        self._state_since = datetime.now()
+                        self.order_state = OrderState.OPEN.value
+                        self._maker_escape_pending = False
+                elif self._order_state == OrderState.PENDING_CLOSE:
+                    if cancelled:
+                        # Exit order cancelled -> retry from OPEN state.
                         self.write_log(
-                            f"Close order cancelled, will retry: {order.vt_orderid}"
+                            f"Close order cancelled, will retry: {vt_orderid}"
                         )
                         self._order_state = OrderState.OPEN
                         self._state_since = datetime.now()
@@ -1599,12 +1649,55 @@ if _VNPY_AVAILABLE:
             self.put_event()
 
         # ------------------------------------------------------------------
+        # Auto-TP helper — called immediately after open fill in on_trade()
+        # ------------------------------------------------------------------
+
+        def _place_auto_tp(self, now: datetime) -> None:
+            """Place a limit close order at entry_fill_price ± auto_tp_ticks immediately
+            after open fill is confirmed.  If the TP order fails to fill within
+            close_order_timeout_sec, it will be cancelled and _manage_exit() will
+            retry with its normal SL/TIMEOUT/etc. logic.
+            """
+            pt = max(self.price_tick, 1e-9)
+            vol = int(round(abs(self._entry_fill_volume)))
+            if vol <= 0:
+                return
+
+            ids: List[str] = []
+            if self._entry_direction == "LONG":
+                tp_price = self._entry_fill_price + self.auto_tp_ticks * pt
+                ids = self._rl_sell(tp_price, vol, now)
+                price_str = f"{tp_price:.1f}"
+            elif self._entry_direction == "SHORT":
+                tp_price = self._entry_fill_price - self.auto_tp_ticks * pt
+                ids = self._rl_cover(tp_price, vol, now)
+                price_str = f"{tp_price:.1f}"
+            else:
+                return
+
+            if ids:
+                self._active_orderids = list(ids)
+                self._order_state = OrderState.PENDING_CLOSE
+                self._state_since = now
+                self.order_state = OrderState.PENDING_CLOSE.value
+                self._pending_exit_reason = "TP"
+                self.write_log(
+                    f"AUTO TP @ {price_str} x{vol} "
+                    f"(fill={self._entry_fill_price:.1f} + {self.auto_tp_ticks:.1f}tick)"
+                )
+            else:
+                self.write_log(
+                    f"[WARN] AUTO TP order blocked by rate limiter — will retry via _manage_exit"
+                )
+
+        # ------------------------------------------------------------------
         # Entry helpers
         # ------------------------------------------------------------------
 
         def _enter_long(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
             # MAKER: post limit at bid (may not fill); TAKER: lift the ask immediately
-            mode = self.sig.fill_mode_long
+            # force_maker_mode overrides signal-engine's MAKER/TAKER decision
+            mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_long
             order_price = snap.bid1 if mode == "MAKER" else snap.ask1
             ids = self._rl_buy(order_price, volume, tick_dt)
             if ids:
@@ -1628,7 +1721,8 @@ if _VNPY_AVAILABLE:
 
         def _enter_short(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
             # MAKER: post limit at ask; TAKER: hit the bid immediately
-            mode = self.sig.fill_mode_short
+            # force_maker_mode overrides signal-engine's MAKER/TAKER decision
+            mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_short
             order_price = snap.ask1 if mode == "MAKER" else snap.bid1
             ids = self._rl_short(order_price, volume, tick_dt)
             if ids:
@@ -1668,8 +1762,9 @@ if _VNPY_AVAILABLE:
             # C1: Fast loss circuit breaker — aggressive immediate exit if
             # the position loses fast_loss_ticks within fast_loss_sec of entry.
             # Indicates we entered into a strongly directional move against us.
+            # Disabled when hold_if_loss=True (never cut on fast adverse move).
             # ----------------------------------------------------------------
-            if elapsed <= self.fast_loss_sec:
+            if not self.hold_if_loss and elapsed <= self.fast_loss_sec:
                 if self.pos > 0:
                     fast_pnl = (snap.bid1 - self._entry_fill_price) / pt
                 elif self.pos < 0:
@@ -1705,7 +1800,9 @@ if _VNPY_AVAILABLE:
                     self._max_favorable_ticks >= self.trailing_activate_ticks
                     and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
                 )
-                is_urgent = pnl_ticks <= -self.loss_ticks or elapsed >= self.max_hold_seconds
+                # When hold_if_loss=True: suppress fixed-SL; only timeout triggers urgency
+                sl_triggered = (pnl_ticks <= -self.loss_ticks) and not self.hold_if_loss
+                is_urgent = sl_triggered or elapsed >= self.max_hold_seconds
                 should_exit = (
                     self.sig.should_exit_long()
                     or pnl_ticks >= self.profit_ticks
@@ -1713,7 +1810,7 @@ if _VNPY_AVAILABLE:
                     or trailing_hit
                 )
                 if should_exit:
-                    if pnl_ticks <= -self.loss_ticks:
+                    if sl_triggered:
                         self._pending_exit_reason = "SL"
                     elif elapsed >= self.max_hold_seconds:
                         self._pending_exit_reason = "TIMEOUT"
@@ -1723,7 +1820,15 @@ if _VNPY_AVAILABLE:
                         self._pending_exit_reason = "TRAILING"
                     else:
                         self._pending_exit_reason = "SIGNAL_FLIP"
-                    exit_price = snap.bid1 if is_urgent else snap.bid1 - pt
+                    if is_urgent:
+                        # Aggressive taker: sell at best bid immediately
+                        exit_price = snap.bid1
+                    elif self._entry_mode == "MAKER":
+                        # MAKER exit: post sell at ask → capture spread (高价反済)
+                        exit_price = snap.ask1
+                    else:
+                        # TAKER exit fallback: cross the bid
+                        exit_price = snap.bid1 - pt
                     ids = self._rl_sell(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
@@ -1738,7 +1843,9 @@ if _VNPY_AVAILABLE:
                     self._max_favorable_ticks >= self.trailing_activate_ticks
                     and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
                 )
-                is_urgent = pnl_ticks <= -self.loss_ticks or elapsed >= self.max_hold_seconds
+                # When hold_if_loss=True: suppress fixed-SL; only timeout triggers urgency
+                sl_triggered = (pnl_ticks <= -self.loss_ticks) and not self.hold_if_loss
+                is_urgent = sl_triggered or elapsed >= self.max_hold_seconds
                 should_exit = (
                     self.sig.should_exit_short()
                     or pnl_ticks >= self.profit_ticks
@@ -1746,7 +1853,7 @@ if _VNPY_AVAILABLE:
                     or trailing_hit
                 )
                 if should_exit:
-                    if pnl_ticks <= -self.loss_ticks:
+                    if sl_triggered:
                         self._pending_exit_reason = "SL"
                     elif elapsed >= self.max_hold_seconds:
                         self._pending_exit_reason = "TIMEOUT"
@@ -1756,7 +1863,15 @@ if _VNPY_AVAILABLE:
                         self._pending_exit_reason = "TRAILING"
                     else:
                         self._pending_exit_reason = "SIGNAL_FLIP"
-                    exit_price = snap.ask1 if is_urgent else snap.ask1 + pt
+                    if is_urgent:
+                        # Aggressive taker: cover at best ask immediately
+                        exit_price = snap.ask1
+                    elif self._entry_mode == "MAKER":
+                        # MAKER exit: post buy at bid → capture spread (低价反済)
+                        exit_price = snap.bid1
+                    else:
+                        # TAKER exit fallback: cross the ask
+                        exit_price = snap.ask1 + pt
                     ids = self._rl_cover(exit_price, abs(self.pos), tick_dt)
                     if ids:
                         self._active_orderids = list(ids)
@@ -1857,6 +1972,28 @@ if _VNPY_AVAILABLE:
 
             elapsed = (now - self._state_since).total_seconds()
 
+            # --- Smart cancel: if PENDING_OPEN and signal has flipped, cancel immediately ---
+            # Avoids sitting in a stale limit order waiting for timeout when the signal is gone.
+            if (
+                self.smart_cancel_on_flip
+                and self._order_state == OrderState.PENDING_OPEN
+                and not self._active_orderids     # no cancel already in flight
+                and not self._maker_escape_pending
+            ):
+                signal_gone = (
+                    (self._entry_direction == "LONG" and not self.sig.can_open_long())
+                    or (self._entry_direction == "SHORT" and not self.sig.can_open_short())
+                )
+                if signal_gone:
+                    self.write_log(
+                        f"[SMART CANCEL] Signal flipped during PENDING_OPEN "
+                        f"({self._entry_direction}) → cancel entry immediately"
+                    )
+                    self._rl_cancel_all(now)
+                    # Do NOT set _maker_escape_pending: signal is gone, just abort on ack.
+                    self._state_since = now
+                    return
+
             # --- MAKER escape: runs before the full open timeout ---
             if (
                 self._order_state == OrderState.PENDING_OPEN
@@ -1865,30 +2002,14 @@ if _VNPY_AVAILABLE:
                 and elapsed < self.open_order_timeout_sec
             ):
                 self.write_log(
-                    f"MAKER escape {elapsed:.2f}s -> cancel and re-enter TAKER"
+                    f"MAKER escape {elapsed:.2f}s -> cancel and wait ack for TAKER retry"
                 )
-                self._rl_cancel_all(now)
-                self._active_orderids = []
-                # Re-enter as TAKER only if signal is still valid
-                ids = []
-                vol = max(self.min_trade_volume, self._entry_volume or self.min_trade_volume)
-                lot = max(1, self.lot_size)
-                vol = (vol // lot) * lot
-                if vol <= 0:
-                    vol = lot
-                if self._entry_direction == "LONG" and self.sig.can_open_long():
-                    ids = self._rl_buy(snap.ask1, vol, now)
-                elif self._entry_direction == "SHORT" and self.sig.can_open_short():
-                    ids = self._rl_short(snap.bid1, vol, now)
-                if ids:
-                    self._active_orderids = list(ids)
-                    self._entry_mode = "TAKER"
+                sent = self._rl_cancel_all(now)
+                if sent:
+                    # Retry will be attempted in on_order after cancel acknowledgement.
+                    self._maker_escape_pending = True
                     self._state_since = now
-                else:
-                    # Signal gone — abort entry
-                    self._reset_position_state()
                 return
-
             # --- Full open timeout ---
             if self._order_state == OrderState.PENDING_OPEN and elapsed >= self.open_order_timeout_sec:
                 self.write_log(
@@ -1911,6 +2032,44 @@ if _VNPY_AVAILABLE:
                     self.order_state = OrderState.OPEN.value
                     self._state_since = now
                 return
+
+        def _retry_maker_escape_as_taker(self, now: datetime) -> bool:
+            """Retry a cancelled MAKER entry as TAKER after cancel acknowledgement."""
+            if not self._maker_escape_pending:
+                return False
+
+            # Consume the pending flag even if we decide not to retry.
+            self._maker_escape_pending = False
+            snap = self._last_snap
+            if snap is None:
+                return False
+
+            vol = max(self.min_trade_volume, self._entry_volume or self.min_trade_volume)
+            lot = max(1, self.lot_size)
+            vol = (vol // lot) * lot
+            if vol <= 0:
+                vol = lot
+
+            ids = []
+            if self._entry_direction == "LONG" and self.sig.can_open_long():
+                ids = self._rl_buy(snap.ask1, vol, now)
+            elif self._entry_direction == "SHORT" and self.sig.can_open_short():
+                ids = self._rl_short(snap.bid1, vol, now)
+
+            if not ids:
+                return False
+
+            self._active_orderids = list(ids)
+            self._entry_mode = "TAKER"
+            self._order_state = OrderState.PENDING_OPEN
+            self.order_state = OrderState.PENDING_OPEN.value
+            self._state_since = now
+            self._last_entry_attempt_dt = now
+            self.write_log(
+                f"MAKER escape retry -> TAKER {self._entry_direction} @ "
+                f"{(snap.ask1 if self._entry_direction == 'LONG' else snap.bid1):.1f} x{vol}"
+            )
+            return True
 
         def _parse_strategy_time_settings(self) -> None:
             def _p(s: str, default: time) -> time:
@@ -2078,8 +2237,18 @@ if _VNPY_AVAILABLE:
             return self.cover(price, volume)
 
         def _rl_cancel_all(self, now: datetime) -> bool:
-            if not self._can_send_order_req(now):
-                return False
+            # Cancel is safety-critical: do not block it by order rate limiter.
+            self._trim_order_req_window(now)
+            if len(self._order_req_ts) >= max(1, self.max_order_req_per_sec):
+                if (
+                    self._last_rate_limit_log_dt is None
+                    or (now - self._last_rate_limit_log_dt).total_seconds() >= 1.0
+                ):
+                    self._last_rate_limit_log_dt = now
+                    self.write_log(
+                        f"[RATE LIMIT] cancel_all bypass "
+                        f"order_req_1s={len(self._order_req_ts)} limit={self.max_order_req_per_sec}"
+                    )
             self._mark_order_req(now)
             self.cancel_all()
             return True
@@ -2183,3 +2352,4 @@ if _VNPY_AVAILABLE:
             self.unrealized_pnl = 0.0
             self._pending_exit_reason = ""
             self._last_close_order_ts = None
+            self._maker_escape_pending = False

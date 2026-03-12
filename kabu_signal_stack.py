@@ -200,6 +200,17 @@ class OrderState(Enum):
     PENDING_CLOSE = "pending_close"
 
 
+class MarketState(Enum):
+    """Micro-market condition used by execution/risk policy."""
+    NORMAL = "NORMAL"
+    QUEUE = "QUEUE"
+    ABNORMAL = "ABNORMAL"
+
+
+# kabu push quote signs that indicate non-normal quote state.
+_SPECIAL_QUOTE_SIGNS = frozenset({"0102", "0103", "0107"})
+
+
 # ---------------------------------------------------------------------------
 # TSE tick size (陷ｻ・ｼ陋滂ｽ､陷雁・ｽｽ繝ｻ 遯ｶ繝ｻstandard domestic equity (霑ｴ・ｾ霑夲ｽｩ隴ｬ・ｪ陟代・
 # NOTE: ETF / REIT / TOPIX500 constituents may differ; verify with JPX circulars.
@@ -338,6 +349,8 @@ class KabuTickAdapter:
             ask_vol1=asks[0][1] if asks else ask_vol1,
             bids=bids,
             asks=asks,
+            bid_sign=str(getattr(tick, "bid_sign", "") or getattr(tick, "BidSign", "") or ""),
+            ask_sign=str(getattr(tick, "ask_sign", "") or getattr(tick, "AskSign", "") or ""),
             last_price=_f("last_price"),
             volume=_f("volume"),
             turnover=_f("turnover"),
@@ -462,6 +475,8 @@ class TickSnapshot:
     ask_vol1: float
     bids: List[Tuple[float, float]]
     asks: List[Tuple[float, float]]
+    bid_sign: str = ""
+    ask_sign: str = ""
     last_price: float = 0.0
     volume: float = 0.0
     turnover: float = 0.0      # cumulative session turnover (・ゑｽ･) 遯ｶ繝ｻused for VWAP calculation
@@ -1126,6 +1141,95 @@ def make_aggressive_stack(pricetick: float = 1.0) -> KabuSignalStack:
     )
 
 
+def make_strategy_preset_balanced() -> Dict[str, object]:
+    """Balanced preset for liquid TSE names (first live tuning candidate)."""
+    return {
+        "trade_volume": 100,
+        "max_position": 300,
+        "enable_long": True,
+        "enable_short": False,
+        "reverse_bid_ask": False,
+        "auto_pricetick": False,
+        "max_spread_ticks": 2.0,
+        "min_best_volume": 50,
+        "strong_signal_threshold": 4.0,
+        "weak_signal_confirm_ticks": 2,
+        "entry_cooldown_sec": 0.4,
+        "open_min_interval_ms": 100.0,
+        "close_min_interval_ms": 50.0,
+        "auto_tp_on_fill": True,
+        "auto_tp_ticks": 1.0,
+        "maker_escape_timeout_sec": 1.5,
+        "smart_cancel_on_flip": True,
+        "max_tick_stale_seconds": 5.0,
+        "stale_quote_ms": 1200,
+        "queue_spread_max_ticks": 1.0,
+        "abnormal_max_spread_ticks": 6.0,
+        "max_event_rate_hz": 160.0,
+        "event_burst_min_events": 6,
+        "state_window_ms": 3000,
+        "jump_threshold_ticks": 4.0,
+        "queue_min_top_qty": 300,
+        "close_only_before_break_min": 5,
+        "fair_value_beta": 0.75,
+        "max_fair_shift_ticks": 3.0,
+        "inventory_skew_ticks": 1.0,
+        "max_fair_drift_ticks": 1.5,
+    }
+
+
+def make_strategy_preset_conservative() -> Dict[str, object]:
+    """Conservative preset focused on fill quality and drawdown control."""
+    p = make_strategy_preset_balanced()
+    p.update(
+        {
+            "max_spread_ticks": 1.5,
+            "min_best_volume": 100,
+            "strong_signal_threshold": 4.8,
+            "weak_signal_confirm_ticks": 3,
+            "entry_cooldown_sec": 0.6,
+            "open_min_interval_ms": 140.0,
+            "max_trade_volume": 200,
+            "risk_scale_min": 0.3,
+            "max_daily_trades": 50,
+            "loss_cooldown_sec": 240.0,
+            "queue_min_top_qty": 500,
+            "abnormal_max_spread_ticks": 5.0,
+            "max_event_rate_hz": 120.0,
+            "jump_threshold_ticks": 3.0,
+            "fair_value_beta": 0.65,
+            "max_fair_drift_ticks": 1.2,
+        }
+    )
+    return p
+
+
+def make_strategy_preset_aggressive() -> Dict[str, object]:
+    """Aggressive preset for fast tape with strict emergency controls."""
+    p = make_strategy_preset_balanced()
+    p.update(
+        {
+            "max_spread_ticks": 2.5,
+            "min_best_volume": 30,
+            "strong_signal_threshold": 3.2,
+            "weak_signal_confirm_ticks": 1,
+            "entry_cooldown_sec": 0.2,
+            "open_min_interval_ms": 70.0,
+            "close_min_interval_ms": 30.0,
+            "max_trade_volume": 400,
+            "maker_escape_timeout_sec": 1.0,
+            "max_event_rate_hz": 220.0,
+            "abnormal_max_spread_ticks": 7.0,
+            "jump_threshold_ticks": 5.0,
+            "fair_value_beta": 0.9,
+            "max_fair_shift_ticks": 4.0,
+            "max_fair_drift_ticks": 2.0,
+            "max_loss_per_trade_jpy": 12000.0,
+        }
+    )
+    return p
+
+
 # ---------------------------------------------------------------------------
 # VeighNa strategy wrapper
 # ---------------------------------------------------------------------------
@@ -1168,7 +1272,8 @@ if _VNPY_AVAILABLE:
         reverse_bid_ask: bool = False   # Set True if kabu gateway passes raw field names
         auto_fix_negative_spread: bool = True
         auto_fix_negative_spread_max_ticks: float = 3.0
-        auto_pricetick: bool = True
+        # Prefer contract pricetick from gateway; keep auto inference off by default.
+        auto_pricetick: bool = False
 
         # Commission 遯ｶ繝ｻkabu ad-valorem model (鬩幢ｽｽ陟趣ｽｦ隰・玄辟夊ｭ√・
         # IMPORTANT: confirm against your actual account plan before live trading.
@@ -1263,6 +1368,24 @@ if _VNPY_AVAILABLE:
         # Verbose logging control (from reference strategy)
         verbose_log: bool = False                 # True: output detailed debug logs (rate-limit reasons, etc.)
 
+        # --- v6 parameters (integrated from kabu_hft_new ideas) ---
+        # Market state detector
+        stale_quote_ms: int = 1200               # snapshot age > stale_quote_ms -> ABNORMAL
+        queue_spread_max_ticks: float = 1.0      # one-tick regime -> QUEUE mode
+        abnormal_max_spread_ticks: float = 6.0   # spread blowout threshold -> ABNORMAL
+        max_event_rate_hz: float = 160.0         # burst threshold (with min events)
+        event_burst_min_events: int = 6          # minimum samples to declare burst
+        state_window_ms: int = 3000              # event-rate rolling window
+        jump_threshold_ticks: float = 4.0        # mid jump threshold -> ABNORMAL
+        queue_min_top_qty: int = 300             # QUEUE mode: retreat if best level is thin
+        close_only_before_break_min: int = 5     # block new entries before lunch close window
+
+        # Fair-value / reservation-price execution controls
+        fair_value_beta: float = 0.75            # edge -> fair shift (ticks)
+        max_fair_shift_ticks: float = 3.0        # cap fair shift in ticks
+        inventory_skew_ticks: float = 1.0        # inventory penalty in ticks
+        max_fair_drift_ticks: float = 1.5        # cancel pending entry when fair drift too far
+
         parameters = [
             "trade_volume", "max_position",
             "enable_long", "enable_short",
@@ -1296,6 +1419,14 @@ if _VNPY_AVAILABLE:
             # v5
             "max_loss_per_trade_jpy",
             "verbose_log",
+            # v6
+            "stale_quote_ms", "queue_spread_max_ticks",
+            "abnormal_max_spread_ticks", "max_event_rate_hz",
+            "event_burst_min_events", "state_window_ms",
+            "jump_threshold_ticks", "queue_min_top_qty",
+            "close_only_before_break_min",
+            "fair_value_beta", "max_fair_shift_ticks",
+            "inventory_skew_ticks", "max_fair_drift_ticks",
         ]
 
         # --- UI-visible variables ---
@@ -1328,6 +1459,10 @@ if _VNPY_AVAILABLE:
         stat_win_rate: float = 0.0
         stat_pf: float = 0.0
         stat_avg_hold: float = 0.0
+        market_state: str = "NORMAL"
+        market_reason: str = "init"
+        market_event_rate_hz: float = 0.0
+        market_jump_ticks: float = 0.0
 
         variables = [
             "price_tick", "order_state",
@@ -1340,6 +1475,7 @@ if _VNPY_AVAILABLE:
             "risk_halt_reason", "order_req_1s", "total_trades", "last_signal",
             "sig_vwap", "sig_book_depth", "sig_flow_flip", "unrealized_pnl",
             "stat_win_rate", "stat_pf", "stat_avg_hold",
+            "market_state", "market_reason", "market_event_rate_hz", "market_jump_ticks",
         ]
 
         def __init__(self, cta_engine, strategy_name, vt_symbol, setting):
@@ -1400,6 +1536,12 @@ if _VNPY_AVAILABLE:
             self._last_recv_time: Optional[datetime] = None
             self._tick_stale_state: bool = False
             self._stale_force_flatten_pending: bool = False
+            self._market_state: MarketState = MarketState.NORMAL
+            self._market_state_reason: str = "init"
+            self._market_event_ts_ns: Deque[int] = deque(maxlen=4096)
+            self._market_prev_mid: float = 0.0
+            self._pending_entry_fair_price: float = 0.0
+            self._pending_entry_alpha: float = 0.0
 
             # Signal engine (rebuilt with live parameters in on_start)
             self.sig = KabuSignalStack(SignalConfig(), 1.0)
@@ -1426,7 +1568,8 @@ if _VNPY_AVAILABLE:
 
             # Step 2: load pricetick from contract if available.
             pt = self.get_pricetick()
-            if pt and pt > 0:
+            has_contract_pt = bool(pt and pt > 0)
+            if has_contract_pt:
                 self.price_tick = float(pt)
 
             if self.reverse_bid_ask:
@@ -1444,12 +1587,22 @@ if _VNPY_AVAILABLE:
                 reverse_bid_ask=self.reverse_bid_ask,
                 auto_fix_negative_spread=self.auto_fix_negative_spread,
                 auto_fix_negative_spread_max_ticks=self.auto_fix_negative_spread_max_ticks,
-                auto_pricetick=self.auto_pricetick,
+                # If contract pricetick exists, disable heuristic auto inference.
+                # Contract metadata is authoritative and avoids accidental 0.1/1.0 mismatch.
+                auto_pricetick=(self.auto_pricetick and not has_contract_pt),
                 znorm_lookback=self.znorm_lookback,
                 flow_flip_threshold=self.flow_flip_threshold,
             )
             self.sig = KabuSignalStack(cfg, self.price_tick)
+            if self.auto_pricetick and has_contract_pt:
+                self.write_log(
+                    f"[pricetick] 合约价位可用({self.price_tick})，关闭auto_pricetick推断以避免覆盖"
+                )
             self._reset_position_state()
+            self._market_state = MarketState.NORMAL
+            self._market_state_reason = "on_start"
+            self._market_event_ts_ns.clear()
+            self._market_prev_mid = 0.0
             self._parse_strategy_time_settings()
             self.write_log(
                 f"on_start pricetick={self.price_tick} "
@@ -1487,7 +1640,9 @@ if _VNPY_AVAILABLE:
                             f"[pricetick] 自动修正: {self.price_tick} → {new_pt} (合约延迟加载)"
                         )
                         self.price_tick = new_pt
-                        self.sig.price_tick = new_pt   # propagate to signal engine
+                        self.sig.update_pricetick(new_pt)   # propagate to signal engine
+                    # Contract pricetick is authoritative once available.
+                    self.sig.cfg.auto_pricetick = False
                     self._price_tick_verified = True
             except Exception:
                 pass  # silent fail; will retry in 30 s
@@ -1561,6 +1716,7 @@ if _VNPY_AVAILABLE:
 
             # v5: periodic pricetick verification (re-read every 30 s until confirmed)
             self._periodic_verify_price_tick(tick_dt)
+            self._update_market_state(snap, tick_dt)
 
             self._sync_sig_vars(tick_dt)
             self._update_unrealized_pnl(snap)
@@ -1568,6 +1724,21 @@ if _VNPY_AVAILABLE:
             self._maybe_log(tick_dt)
             self._check_pending_timeouts(tick_dt, snap)
             self._try_retry_pending_auto_tp(tick_dt)
+
+            if self._market_state == MarketState.ABNORMAL:
+                if (
+                    self._order_state == OrderState.PENDING_OPEN
+                    and self._active_orderids
+                    and not self._cancel_waiting_ack
+                ):
+                    sent = self._rl_cancel_all(tick_dt)
+                    if sent:
+                        self._cancel_waiting_ack = True
+                        self._state_since = tick_dt
+                elif self._order_state == OrderState.OPEN:
+                    self._force_flatten(snap, tick_dt, reason=f"abnormal_{self._market_state_reason}")
+                    self._throttled_put_event(tick_dt)
+                    return
 
             # 2. State machine guard 遯ｶ繝ｻif not IDLE, only manage open position
             if self._order_state != OrderState.IDLE:
@@ -1585,6 +1756,10 @@ if _VNPY_AVAILABLE:
                 return
 
             if not self._is_trading_allowed or not self.sig.all_gates_ok:
+                self._throttled_put_event(tick_dt)
+                return
+
+            if self._market_state == MarketState.ABNORMAL:
                 self._throttled_put_event(tick_dt)
                 return
 
@@ -1681,6 +1856,8 @@ if _VNPY_AVAILABLE:
                 self.last_entry_price = self._entry_fill_price
                 self.order_state = OrderState.OPEN.value
                 self._maker_escape_pending = False
+                self._pending_entry_fair_price = 0.0
+                self._pending_entry_alpha = 0.0
                 self.write_log(
                     f"FILL OPEN {self._entry_direction} "
                     f"avg={self._entry_fill_price:.1f} vol={self._entry_fill_volume:.0f}"
@@ -1802,6 +1979,14 @@ if _VNPY_AVAILABLE:
                         self.order_state = OrderState.OPEN.value
                         if was_tp:
                             self._try_place_auto_tp(datetime.now())
+                elif self._order_state == OrderState.OPEN:
+                    # Fallback for callback-order race:
+                    # when open fill callback comes before final order-ack cleanup,
+                    # auto TP can be skipped because _active_orderids was still non-empty.
+                    # If order queue is now clear and we are genuinely in OPEN state,
+                    # attempt auto TP once.
+                    if self._entry_fill_volume > 0 and not self._pending_exit_reason:
+                        self._try_place_auto_tp(datetime.now())
 
             self.put_event()
 
@@ -1952,7 +2137,21 @@ if _VNPY_AVAILABLE:
             # MAKER: post limit at bid (may not fill); TAKER: lift the ask immediately
             # force_maker_mode overrides signal-engine's MAKER/TAKER decision
             mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_long
-            order_price = snap.bid1 if mode == "MAKER" else snap.ask1
+            pt = max(self.price_tick, 1e-9)
+            fair_price, reservation = self._fair_and_reservation(snap)
+            if mode == "MAKER":
+                order_price = snap.bid1
+                # In one-tick queue regimes, retreat if top queue is too thin.
+                if self._market_state == MarketState.QUEUE and snap.bid_vol1 < max(1, self.queue_min_top_qty):
+                    order_price = max(snap.bid1 - pt, pt)
+                # If reservation price is below bid by >=1 tick, retreat one tick.
+                elif reservation <= snap.bid1 - pt:
+                    order_price = max(snap.bid1 - pt, pt)
+                # Strong alpha and wider spread: improve one tick for better fill probability.
+                elif abs(self.sig.edge_score) >= self.strong_signal_threshold and snap.spread_ticks >= 2.0:
+                    order_price = min(snap.bid1 + pt, snap.ask1 - pt)
+            else:
+                order_price = snap.ask1
             ids = self._rl_buy(order_price, volume, tick_dt)
             if ids:
                 self._active_orderids = list(ids)
@@ -1965,6 +2164,8 @@ if _VNPY_AVAILABLE:
                 self._last_entry_attempt_dt = tick_dt
                 self._cancel_waiting_ack = False
                 self._pending_open_orphan_since = None
+                self._pending_entry_fair_price = fair_price
+                self._pending_entry_alpha = self.sig.edge_score
                 self._clear_pending_auto_tp()
                 self.order_state = OrderState.PENDING_OPEN.value
                 self.last_signal = (
@@ -1980,7 +2181,18 @@ if _VNPY_AVAILABLE:
             # MAKER: post limit at ask; TAKER: hit the bid immediately
             # force_maker_mode overrides signal-engine's MAKER/TAKER decision
             mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_short
-            order_price = snap.ask1 if mode == "MAKER" else snap.bid1
+            pt = max(self.price_tick, 1e-9)
+            fair_price, reservation = self._fair_and_reservation(snap)
+            if mode == "MAKER":
+                order_price = snap.ask1
+                if self._market_state == MarketState.QUEUE and snap.ask_vol1 < max(1, self.queue_min_top_qty):
+                    order_price = snap.ask1 + pt
+                elif reservation >= snap.ask1 + pt:
+                    order_price = snap.ask1 + pt
+                elif abs(self.sig.edge_score) >= self.strong_signal_threshold and snap.spread_ticks >= 2.0:
+                    order_price = max(snap.ask1 - pt, snap.bid1 + pt)
+            else:
+                order_price = snap.bid1
             ids = self._rl_short(order_price, volume, tick_dt)
             if ids:
                 self._active_orderids = list(ids)
@@ -1993,6 +2205,8 @@ if _VNPY_AVAILABLE:
                 self._last_entry_attempt_dt = tick_dt
                 self._cancel_waiting_ack = False
                 self._pending_open_orphan_since = None
+                self._pending_entry_fair_price = fair_price
+                self._pending_entry_alpha = self.sig.edge_score
                 self._clear_pending_auto_tp()
                 self.order_state = OrderState.PENDING_OPEN.value
                 self.last_signal = (
@@ -2258,6 +2472,10 @@ if _VNPY_AVAILABLE:
                 self._signal_pending_dir = 0
                 self._signal_pending_count = 0
                 self._signal_pending_dt = None
+                self._market_event_ts_ns.clear()
+                self._market_prev_mid = 0.0
+                self._market_state = MarketState.NORMAL
+                self._market_state_reason = "new_day"
                 self.write_log(f"New trading day: {date_str}")
 
         def _check_pending_timeouts(self, now: datetime, snap: TickSnapshot) -> None:
@@ -2313,10 +2531,22 @@ if _VNPY_AVAILABLE:
                     (self._entry_direction == "LONG" and not self.sig.can_open_long())
                     or (self._entry_direction == "SHORT" and not self.sig.can_open_short())
                 )
-                if signal_gone:
+                alpha_flip = (
+                    self._pending_entry_alpha != 0.0
+                    and (self.sig.edge_score * self._pending_entry_alpha) < 0
+                    and abs(self.sig.edge_score) >= max(0.5, self.strong_signal_threshold * 0.5)
+                )
+                fair_drift = False
+                fair_drift_ticks = 0.0
+                if self._pending_entry_fair_price > 0:
+                    fair_now, _ = self._fair_and_reservation(snap)
+                    fair_drift_ticks = abs(fair_now - self._pending_entry_fair_price) / max(self.price_tick, 1e-9)
+                    fair_drift = fair_drift_ticks >= self.max_fair_drift_ticks
+                if signal_gone or alpha_flip or fair_drift:
+                    reason = "signal_flip" if signal_gone else ("alpha_flip" if alpha_flip else "fair_drift")
                     self.write_log(
-                        f"[SMART CANCEL] Signal flipped during PENDING_OPEN "
-                        f"({self._entry_direction}) 遶翫・cancel entry immediately"
+                        f"[SMART CANCEL] {reason} during PENDING_OPEN ({self._entry_direction})"
+                        + (f" drift={fair_drift_ticks:.2f}t" if fair_drift else "")
                     )
                     sent = self._rl_cancel_all(now)
                     if sent:
@@ -2401,11 +2631,98 @@ if _VNPY_AVAILABLE:
             self._last_entry_attempt_dt = now
             self._pending_open_orphan_since = None
             self._cancel_waiting_ack = False
+            fair_price, _ = self._fair_and_reservation(snap)
+            self._pending_entry_fair_price = fair_price
+            self._pending_entry_alpha = self.sig.edge_score
             self.write_log(
                 f"MAKER escape retry -> TAKER {self._entry_direction} @ "
                 f"{(snap.ask1 if self._entry_direction == 'LONG' else snap.bid1):.1f} x{vol}"
             )
             return True
+
+        def _update_market_state(self, snap: TickSnapshot, tick_dt: datetime) -> None:
+            """Detect NORMAL/QUEUE/ABNORMAL state from spread/stale/rate/jump."""
+            now_ns = int(datetime.now().timestamp() * 1_000_000_000)
+            # Use local receive clock for event-rate estimation; quote timestamps
+            # may be second-level granularity and would inflate burst detection.
+            event_ts_ns = now_ns
+            quote_ts_ns = int(tick_dt.timestamp() * 1_000_000_000) if isinstance(tick_dt, datetime) else now_ns
+            if quote_ts_ns <= 0:
+                quote_ts_ns = now_ns
+
+            self._market_event_ts_ns.append(event_ts_ns)
+            window_ns = max(250, int(self.state_window_ms)) * 1_000_000
+            while self._market_event_ts_ns and event_ts_ns - self._market_event_ts_ns[0] > window_ns:
+                self._market_event_ts_ns.popleft()
+
+            if len(self._market_event_ts_ns) >= 2:
+                duration_ns = max(1, event_ts_ns - self._market_event_ts_ns[0])
+                event_rate_hz = (len(self._market_event_ts_ns) - 1) * 1_000_000_000 / duration_ns
+            else:
+                event_rate_hz = 0.0
+
+            pt = max(self.price_tick, 1e-9)
+            jump_ticks = 0.0
+            if self._market_prev_mid > 0:
+                jump_ticks = abs(snap.mid - self._market_prev_mid) / pt
+            self._market_prev_mid = snap.mid
+
+            # Guard against timezone mismatch in quote timestamp parsing.
+            if abs(now_ns - quote_ts_ns) > 12 * 3600 * 1_000_000_000:
+                stale_ms = 0.0
+            else:
+                stale_ms = max(0.0, (now_ns - quote_ts_ns) / 1_000_000)
+            spread_ticks = snap.spread_ticks
+            bid_sign = (snap.bid_sign or "").strip()
+            ask_sign = (snap.ask_sign or "").strip()
+
+            state = MarketState.NORMAL
+            reason = "normal_flow"
+            if stale_ms > max(1, int(self.stale_quote_ms)):
+                state = MarketState.ABNORMAL
+                reason = "stale_quote"
+            elif bid_sign in _SPECIAL_QUOTE_SIGNS or ask_sign in _SPECIAL_QUOTE_SIGNS:
+                state = MarketState.ABNORMAL
+                reason = "special_quote_sign"
+            elif spread_ticks >= self.abnormal_max_spread_ticks:
+                state = MarketState.ABNORMAL
+                reason = "spread_blowout"
+            elif (
+                len(self._market_event_ts_ns) >= max(2, self.event_burst_min_events)
+                and event_rate_hz >= self.max_event_rate_hz
+            ):
+                state = MarketState.ABNORMAL
+                reason = "event_burst"
+            elif jump_ticks >= self.jump_threshold_ticks:
+                state = MarketState.ABNORMAL
+                reason = "price_jump"
+            elif spread_ticks <= self.queue_spread_max_ticks + 1e-9:
+                state = MarketState.QUEUE
+                reason = "one_tick_queue"
+
+            if state != self._market_state or reason != self._market_state_reason:
+                self._vlog(f"[MARKET] {self._market_state.value}->{state.value} reason={reason}")
+
+            self._market_state = state
+            self._market_state_reason = reason
+            self.market_state = state.value
+            self.market_reason = reason
+            self.market_event_rate_hz = float(event_rate_hz)
+            self.market_jump_ticks = float(jump_ticks)
+
+        def _fair_and_reservation(self, snap: TickSnapshot) -> Tuple[float, float]:
+            """Compute fair value and inventory-skewed reservation price."""
+            pt = max(self.price_tick, 1e-9)
+            fair_shift_ticks = max(
+                -self.max_fair_shift_ticks,
+                min(self.max_fair_shift_ticks, self.fair_value_beta * self.sig.edge_score),
+            )
+            fair_price = snap.mid + fair_shift_ticks * pt
+            inventory_ratio = 0.0
+            if self.max_position > 0:
+                inventory_ratio = max(-1.0, min(1.0, self.pos / float(self.max_position)))
+            reservation_price = fair_price - self.inventory_skew_ticks * inventory_ratio * pt
+            return fair_price, reservation_price
 
         def _parse_strategy_time_settings(self) -> None:
             def _p(s: str, default: time) -> time:
@@ -2430,6 +2747,14 @@ if _VNPY_AVAILABLE:
             cutoff = getattr(self, "_no_new_entry_after_time", time(15, 24, 0))
             if tm >= cutoff:
                 return False
+            cool_min = max(0, int(self.close_only_before_break_min))
+            if cool_min > 0:
+                m_close_only = (datetime(2000, 1, 1, 11, 30, 0) - timedelta(minutes=cool_min)).time()
+                a_close_only = (datetime(2000, 1, 1, 15, 30, 0) - timedelta(minutes=cool_min)).time()
+                if m_close_only <= tm < time(11, 30, 0):
+                    return False
+                if a_close_only <= tm <= time(15, 30, 0):
+                    return False
             if self.hot_open_guard:
                 # Morning open guard
                 if time(9, 0, 0) <= tm < time(9, 2, 0):
@@ -2543,6 +2868,13 @@ if _VNPY_AVAILABLE:
             self._order_req_ts.append(now)
             self.order_req_1s = len(self._order_req_ts)
 
+        def _align_price(self, price: float) -> float:
+            """Align price to current tick size to reduce broker rejects."""
+            pt = max(self.price_tick, 1e-9)
+            if price <= 0:
+                return pt
+            return max(pt, round(price / pt) * pt)
+
         def _rl_buy(self, price: float, volume: int, now: datetime):
             # Open-order interval guard (separate from per-sec window)
             if self._last_open_order_ts is not None:
@@ -2552,7 +2884,7 @@ if _VNPY_AVAILABLE:
                 return []
             self._last_open_order_ts = now
             self._mark_order_req(now)
-            return self.buy(price, volume)
+            return self.buy(self._align_price(price), volume)
 
         def _rl_short(self, price: float, volume: int, now: datetime):
             if self._last_open_order_ts is not None:
@@ -2562,7 +2894,7 @@ if _VNPY_AVAILABLE:
                 return []
             self._last_open_order_ts = now
             self._mark_order_req(now)
-            return self.short(price, volume)
+            return self.short(self._align_price(price), volume)
 
         def _rl_sell(self, price: float, volume: int, now: datetime):
             # Respect global request budget while keeping a short close interval.
@@ -2573,7 +2905,7 @@ if _VNPY_AVAILABLE:
                 return []
             self._last_close_order_ts = now
             self._mark_order_req(now)
-            return self.sell(price, volume)
+            return self.sell(self._align_price(price), volume)
 
         def _rl_cover(self, price: float, volume: int, now: datetime):
             if self._last_close_order_ts is not None:
@@ -2583,7 +2915,7 @@ if _VNPY_AVAILABLE:
                 return []
             self._last_close_order_ts = now
             self._mark_order_req(now)
-            return self.cover(price, volume)
+            return self.cover(self._align_price(price), volume)
 
         def _rl_cancel_all(self, now: datetime) -> bool:
             # Cancel is safety-critical: do not block it by order rate limiter.
@@ -2612,6 +2944,8 @@ if _VNPY_AVAILABLE:
                     setattr(self, k, v)
             self._trim_order_req_window(now or datetime.now())
             self.order_state = self._order_state.value
+            self.market_state = self._market_state.value
+            self.market_reason = self._market_state_reason
             # v4: update PnL stat variables for UI display
             stats = self._pnl_tracker.stats()
             if stats:
@@ -2653,6 +2987,7 @@ if _VNPY_AVAILABLE:
                 self._last_log_dt = dt
                 self.write_log(
                     f"{self.sig.summary()} | "
+                    f"mkt={self._market_state.value}:{self._market_state_reason} "
                     f"pnl={self.daily_pnl:.0f}JPY dd={self.daily_drawdown:.0f} "
                     f"dtrades={self.daily_trades} total={self.total_trades} "
                     f"loss_streak={self.consecutive_losses}"
@@ -2705,8 +3040,7 @@ if _VNPY_AVAILABLE:
             self._cancel_waiting_ack = False
             self._pending_open_orphan_since = None
             self._signal_pending_dt = None
+            self._pending_entry_fair_price = 0.0
+            self._pending_entry_alpha = 0.0
             self._clear_pending_auto_tp()
             self._stale_force_flatten_pending = False
-
-
-

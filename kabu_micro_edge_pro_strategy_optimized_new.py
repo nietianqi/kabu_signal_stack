@@ -707,8 +707,12 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
         try:
             traded = float(getattr(order, "traded", 0) or 0)
-            if traded > 0 or (not order.is_active()):
-                _status_cn = getattr(order.status, "value", str(order.status))
+            _status = getattr(order, "status", None)
+            # 只在异常情况打印：拒单 或 traded=0的纯撤单（正常成交由on_trade的[FILL]反映）
+            _is_rejected = _status is not None and getattr(_status, "value", "") == "拒单"
+            _is_pure_cancel = (not order.is_active()) and traded == 0
+            if _is_rejected or _is_pure_cancel:
+                _status_cn = getattr(_status, "value", str(_status))
                 _dir_cn = getattr(order.direction, "value", str(order.direction))
                 _meta = self.active_orders.get(order.vt_orderid)
                 _purpose = f" [{_meta.purpose}]" if _meta else ""
@@ -1298,6 +1302,34 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         else:
             self._reset_confirm()
             self._last_confirm_tick_time = None
+            # [NEAR♦] 近失效诊断：若主指标有一个≥60%阈值，显示哪个是瓶颈（帮助调参）
+            _book_r = book_imb / self.book_imbalance_long if self.book_imbalance_long > 0 else 0.0
+            _of_r = of_imb / self.of_imbalance_long if self.of_imbalance_long > 0 else 0.0
+            _mom_r = mom / self.mom_long_threshold if self.mom_long_threshold > 0 else 0.0
+            _sb_r = (-book_imb) / self.book_imbalance_short if self.book_imbalance_short > 0 else 0.0
+            _sof_r = (-of_imb) / self.of_imbalance_short if self.of_imbalance_short > 0 else 0.0
+            _smom_r = (-mom) / self.mom_short_threshold if self.mom_short_threshold > 0 else 0.0
+            _max_long = max(_book_r, _of_r, _mom_r)
+            _max_short = max(_sb_r, _sof_r, _smom_r)
+            if max(_max_long, _max_short) >= 0.6:
+                if _max_long >= _max_short:
+                    _weak = min((_book_r, "book"), (_of_r, "ofi"), (_mom_r, "mom"), key=lambda x: x[0])
+                    self._gate_log(
+                        f"[NEAR♦多] book={book_imb:+.3f}/{self.book_imbalance_long:.2f}({_book_r*100:.0f}%) "
+                        f"ofi={of_imb:+.3f}/{self.of_imbalance_long:.2f}({_of_r*100:.0f}%) "
+                        f"mom={mom:+.3f}/{self.mom_long_threshold:.2f}({_mom_r*100:.0f}%) "
+                        f"→ 瓶颈:{_weak[1]}",
+                        tick.datetime,
+                    )
+                else:
+                    _weak = min((_sb_r, "book"), (_sof_r, "ofi"), (_smom_r, "mom"), key=lambda x: x[0])
+                    self._gate_log(
+                        f"[NEAR♦空] book={book_imb:+.3f}/{-self.book_imbalance_short:.2f}({_sb_r*100:.0f}%) "
+                        f"ofi={of_imb:+.3f}/{-self.of_imbalance_short:.2f}({_sof_r*100:.0f}%) "
+                        f"mom={mom:+.3f}/{-self.mom_short_threshold:.2f}({_smom_r*100:.0f}%) "
+                        f"→ 瓶颈:{_weak[1]}",
+                        tick.datetime,
+                    )
             return
 
         # 🚀 v2优化: 动态计算所需确认次数
@@ -1904,8 +1936,6 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             return []
         if isinstance(ids, str):
             ids = [ids]
-        _dir_cn = getattr(direction, "value", str(direction))
-        self.write_log(f"✅ [委托] {purpose} {_dir_cn} px={price:.0f} vol={volume} ids={ids}")
         for oid in ids:
             self.active_orders[str(oid)] = _OrderMeta(now, purpose, direction, float(price), int(volume))
         self._last_order_action_dt = now
@@ -2398,6 +2428,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self._need_submit_limit_tp = False  # 重置标志
         self._limit_tp_retry_count = 0  # 重置重试计数
         self._limit_tp_submit_after = None  # ✅ 重置延迟提交时间
+        # ✅ 修复：pos=0后清理active_orders，防止on_order回调延迟导致_check_entry被永久阻塞
+        self.active_orders.clear()
 
         # 风控检查
         if self.enable_auto_stop:

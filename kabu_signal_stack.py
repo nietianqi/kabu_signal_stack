@@ -1145,7 +1145,7 @@ def make_strategy_preset_balanced() -> Dict[str, object]:
     """Balanced preset for liquid TSE names (first live tuning candidate)."""
     return {
         "trade_volume": 100,
-        "max_position": 300,
+        "max_position": 600,
         "enable_long": True,
         "enable_short": False,
         "reverse_bid_ask": False,
@@ -1157,8 +1157,11 @@ def make_strategy_preset_balanced() -> Dict[str, object]:
         "entry_cooldown_sec": 0.4,
         "open_min_interval_ms": 100.0,
         "close_min_interval_ms": 50.0,
+        "hold_if_loss": True,
+        "strict_entry_advantage": True,
+        "min_entry_edge_ticks": 1.0,
         "auto_tp_on_fill": True,
-        "auto_tp_ticks": 1.0,
+        "auto_tp_ticks": 2.0,
         "maker_escape_timeout_sec": 1.5,
         "smart_cancel_on_flip": True,
         "max_tick_stale_seconds": 5.0,
@@ -1189,7 +1192,7 @@ def make_strategy_preset_conservative() -> Dict[str, object]:
             "weak_signal_confirm_ticks": 3,
             "entry_cooldown_sec": 0.6,
             "open_min_interval_ms": 140.0,
-            "max_trade_volume": 200,
+            "max_trade_volume": 300,
             "risk_scale_min": 0.3,
             "max_daily_trades": 50,
             "loss_cooldown_sec": 240.0,
@@ -1216,7 +1219,7 @@ def make_strategy_preset_aggressive() -> Dict[str, object]:
             "entry_cooldown_sec": 0.2,
             "open_min_interval_ms": 70.0,
             "close_min_interval_ms": 30.0,
-            "max_trade_volume": 400,
+            "max_trade_volume": 600,
             "maker_escape_timeout_sec": 1.0,
             "max_event_rate_hz": 220.0,
             "abnormal_max_spread_ticks": 7.0,
@@ -1258,7 +1261,7 @@ if _VNPY_AVAILABLE:
 
         # --- Tunable parameters ---
         trade_volume: int = 100
-        max_position: int = 300
+        max_position: int = 600
         enable_long: bool = True
         enable_short: bool = False
 
@@ -1302,7 +1305,7 @@ if _VNPY_AVAILABLE:
         # Dynamic sizing
         lot_size: int = 100
         min_trade_volume: int = 100
-        max_trade_volume: int = 300
+        max_trade_volume: int = 600
         risk_scale_min: float = 0.4
 
         # Daily risk limits
@@ -1336,18 +1339,22 @@ if _VNPY_AVAILABLE:
         close_min_interval_ms: float = 50.0      # minimum ms between two consecutive close orders
 
         # Hold-through-loss mode
-        hold_if_loss: bool = False               # When True: suppress SL & fast-loss exits;
-                                                 # position exits only on TP/TIMEOUT/TRAILING/SIGNAL_FLIP
+        hold_if_loss: bool = True                # When True: losing positions are not closed by
+                                                 # normal signal/timeout/trailing logic.
 
         # MAKER mode override
         force_maker_mode: bool = False           # When True: always enter at bid(long)/ask(short),
                                                  # exit at ask(long)/bid(short) 遯ｶ繝ｻcaptures the spread.
                                                  # When False: signal engine decides MAKER vs TAKER.
 
+        # Entry edge discipline
+        strict_entry_advantage: bool = True      # Only open when the quoted price is favorable.
+        min_entry_edge_ticks: float = 1.0        # Minimum fair-value edge in ticks required for entry.
+
         # Auto-TP on fill
         auto_tp_on_fill: bool = True             # When True: place limit TP close order immediately
                                                  # when open fill is confirmed (vs waiting for next tick)
-        auto_tp_ticks: float = 1.0               # TP price offset in ticks from fill price
+        auto_tp_ticks: float = 2.0               # TP price offset in ticks from fill price
                                                  # LONG: fill + auto_tp_ticks*pt; SHORT: fill - auto_tp_ticks*pt
         auto_tp_retry_max: int = 8              # retry count when immediate TP submit is blocked/rejected
         auto_tp_retry_delay_sec: float = 0.3     # retry delay for pending TP submit queue
@@ -1412,6 +1419,7 @@ if _VNPY_AVAILABLE:
             "open_min_interval_ms", "close_min_interval_ms",
             "hold_if_loss",
             "force_maker_mode",
+            "strict_entry_advantage", "min_entry_edge_ticks",
             "auto_tp_on_fill", "auto_tp_ticks",
             "auto_tp_retry_max", "auto_tp_retry_delay_sec",
             "smart_cancel_on_flip",
@@ -2133,25 +2141,41 @@ if _VNPY_AVAILABLE:
         # Entry helpers
         # ------------------------------------------------------------------
 
-        def _enter_long(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
-            # MAKER: post limit at bid (may not fill); TAKER: lift the ask immediately
-            # force_maker_mode overrides signal-engine's MAKER/TAKER decision
-            mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_long
+        def _build_entry_plan(self, snap: TickSnapshot, direction: int) -> Tuple[str, float, float, float]:
+            """Build entry mode, order price, fair value and reservation price."""
             pt = max(self.price_tick, 1e-9)
             fair_price, reservation = self._fair_and_reservation(snap)
-            if mode == "MAKER":
-                order_price = snap.bid1
-                # In one-tick queue regimes, retreat if top queue is too thin.
-                if self._market_state == MarketState.QUEUE and snap.bid_vol1 < max(1, self.queue_min_top_qty):
-                    order_price = max(snap.bid1 - pt, pt)
-                # If reservation price is below bid by >=1 tick, retreat one tick.
-                elif reservation <= snap.bid1 - pt:
-                    order_price = max(snap.bid1 - pt, pt)
-                # Strong alpha and wider spread: improve one tick for better fill probability.
-                elif abs(self.sig.edge_score) >= self.strong_signal_threshold and snap.spread_ticks >= 2.0:
-                    order_price = min(snap.bid1 + pt, snap.ask1 - pt)
+            strict_mode = self.strict_entry_advantage or self.force_maker_mode
+            if direction > 0:
+                mode = "MAKER" if strict_mode else self.sig.fill_mode_long
+                if mode == "MAKER":
+                    price = snap.bid1
+                    if self._market_state == MarketState.QUEUE and snap.bid_vol1 < max(1, self.queue_min_top_qty):
+                        price = max(snap.bid1 - pt, pt)
+                    elif reservation <= snap.bid1 - pt:
+                        price = max(snap.bid1 - pt, pt)
+                    elif (not self.strict_entry_advantage and abs(self.sig.edge_score) >= self.strong_signal_threshold
+                          and snap.spread_ticks >= 2.0):
+                        price = min(snap.bid1 + pt, snap.ask1 - pt)
+                else:
+                    price = snap.ask1
             else:
-                order_price = snap.ask1
+                mode = "MAKER" if strict_mode else self.sig.fill_mode_short
+                if mode == "MAKER":
+                    price = snap.ask1
+                    if self._market_state == MarketState.QUEUE and snap.ask_vol1 < max(1, self.queue_min_top_qty):
+                        price = snap.ask1 + pt
+                    elif reservation >= snap.ask1 + pt:
+                        price = snap.ask1 + pt
+                    elif (not self.strict_entry_advantage and abs(self.sig.edge_score) >= self.strong_signal_threshold
+                          and snap.spread_ticks >= 2.0):
+                        price = max(snap.ask1 - pt, snap.bid1 + pt)
+                else:
+                    price = snap.bid1
+            return mode, self._align_price(price), fair_price, reservation
+
+        def _enter_long(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
+            mode, order_price, fair_price, _reservation = self._build_entry_plan(snap, +1)
             ids = self._rl_buy(order_price, volume, tick_dt)
             if ids:
                 self._active_orderids = list(ids)
@@ -2178,21 +2202,7 @@ if _VNPY_AVAILABLE:
                 )
 
         def _enter_short(self, snap: TickSnapshot, tick_dt: datetime, volume: int) -> None:
-            # MAKER: post limit at ask; TAKER: hit the bid immediately
-            # force_maker_mode overrides signal-engine's MAKER/TAKER decision
-            mode = "MAKER" if self.force_maker_mode else self.sig.fill_mode_short
-            pt = max(self.price_tick, 1e-9)
-            fair_price, reservation = self._fair_and_reservation(snap)
-            if mode == "MAKER":
-                order_price = snap.ask1
-                if self._market_state == MarketState.QUEUE and snap.ask_vol1 < max(1, self.queue_min_top_qty):
-                    order_price = snap.ask1 + pt
-                elif reservation >= snap.ask1 + pt:
-                    order_price = snap.ask1 + pt
-                elif abs(self.sig.edge_score) >= self.strong_signal_threshold and snap.spread_ticks >= 2.0:
-                    order_price = max(snap.ask1 - pt, snap.bid1 + pt)
-            else:
-                order_price = snap.bid1
+            mode, order_price, fair_price, _reservation = self._build_entry_plan(snap, -1)
             ids = self._rl_short(order_price, volume, tick_dt)
             if ids:
                 self._active_orderids = list(ids)
@@ -2308,23 +2318,26 @@ if _VNPY_AVAILABLE:
                     self._max_favorable_ticks >= self.trailing_activate_ticks
                     and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
                 )
-                # When hold_if_loss=True: suppress fixed-SL; only timeout triggers urgency
+                loss_hold = self.hold_if_loss and pnl_ticks < 0
                 sl_triggered = (pnl_ticks <= -self.loss_ticks) and not self.hold_if_loss
-                is_urgent = sl_triggered or elapsed >= self.max_hold_seconds
+                timeout_triggered = (elapsed >= self.max_hold_seconds) and not loss_hold
+                signal_exit = self.sig.should_exit_long() and not loss_hold
+                trailing_exit = trailing_hit and not loss_hold
+                is_urgent = sl_triggered or timeout_triggered
                 should_exit = (
-                    self.sig.should_exit_long()
+                    signal_exit
                     or pnl_ticks >= self.profit_ticks
                     or is_urgent
-                    or trailing_hit
+                    or trailing_exit
                 )
                 if should_exit:
                     if sl_triggered:
                         self._pending_exit_reason = "SL"
-                    elif elapsed >= self.max_hold_seconds:
+                    elif timeout_triggered:
                         self._pending_exit_reason = "TIMEOUT"
                     elif pnl_ticks >= self.profit_ticks:
                         self._pending_exit_reason = "TP"
-                    elif trailing_hit:
+                    elif trailing_exit:
                         self._pending_exit_reason = "TRAILING"
                     else:
                         self._pending_exit_reason = "SIGNAL_FLIP"
@@ -2352,23 +2365,26 @@ if _VNPY_AVAILABLE:
                     self._max_favorable_ticks >= self.trailing_activate_ticks
                     and (self._max_favorable_ticks - pnl_ticks) >= self.trailing_drawdown_ticks
                 )
-                # When hold_if_loss=True: suppress fixed-SL; only timeout triggers urgency
+                loss_hold = self.hold_if_loss and pnl_ticks < 0
                 sl_triggered = (pnl_ticks <= -self.loss_ticks) and not self.hold_if_loss
-                is_urgent = sl_triggered or elapsed >= self.max_hold_seconds
+                timeout_triggered = (elapsed >= self.max_hold_seconds) and not loss_hold
+                signal_exit = self.sig.should_exit_short() and not loss_hold
+                trailing_exit = trailing_hit and not loss_hold
+                is_urgent = sl_triggered or timeout_triggered
                 should_exit = (
-                    self.sig.should_exit_short()
+                    signal_exit
                     or pnl_ticks >= self.profit_ticks
                     or is_urgent
-                    or trailing_hit
+                    or trailing_exit
                 )
                 if should_exit:
                     if sl_triggered:
                         self._pending_exit_reason = "SL"
-                    elif elapsed >= self.max_hold_seconds:
+                    elif timeout_triggered:
                         self._pending_exit_reason = "TIMEOUT"
                     elif pnl_ticks >= self.profit_ticks:
                         self._pending_exit_reason = "TP"
-                    elif trailing_hit:
+                    elif trailing_exit:
                         self._pending_exit_reason = "TRAILING"
                     else:
                         self._pending_exit_reason = "SIGNAL_FLIP"
@@ -2604,6 +2620,8 @@ if _VNPY_AVAILABLE:
 
             # Consume the pending flag even if we decide not to retry.
             self._maker_escape_pending = False
+            if self.strict_entry_advantage or self.force_maker_mode:
+                return False
             snap = self._last_snap
             if snap is None:
                 return False
@@ -2809,6 +2827,8 @@ if _VNPY_AVAILABLE:
 
             raw = int(base * strength_scale * dd_scale * loss_scale)
             raw = max(self.min_trade_volume, min(self.max_trade_volume, raw))
+            headroom = max(0, int(self.max_position) - abs(int(self.pos)))
+            raw = min(raw, headroom)
             lot = max(1, self.lot_size)
             sized = (raw // lot) * lot
             return max(0, sized)
@@ -2833,6 +2853,16 @@ if _VNPY_AVAILABLE:
                 required = self.sig.cfg.edge_score_short_threshold + spread_extra
                 if self.sig.edge_score > -required:
                     return False
+
+            mode, order_price, fair_price, _reservation = self._build_entry_plan(snap, direction)
+            pt = max(self.price_tick, 1e-9)
+            edge_ticks = (
+                (fair_price - order_price) / pt if direction > 0 else (order_price - fair_price) / pt
+            )
+            if self.strict_entry_advantage and mode != "MAKER":
+                return False
+            if edge_ticks < self.min_entry_edge_ticks:
+                return False
 
             # B3: Market impact check 遯ｶ繝ｻreject if our order would consume more than
             # max_impact_pct of the best-level size (signals poor liquidity for our size).

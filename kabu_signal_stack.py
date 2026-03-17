@@ -1545,11 +1545,12 @@ if _VNPY_AVAILABLE:
             "strict_entry_advantage", "min_entry_edge_ticks",
             "auto_tp_on_fill", "auto_tp_ticks",
             "auto_tp_retry_max", "auto_tp_retry_delay_sec",
+            "auto_tp_fast_retries", "auto_tp_slow_retry_sec",
             "smart_cancel_on_flip",
             "max_tick_stale_seconds", "stale_feed_force_flatten",
             # v5
             "max_loss_per_trade_jpy",
-            "verbose_log",
+            "verbose_log", "near_miss_log",
             # v6
             "stale_quote_ms", "queue_spread_max_ticks",
             "abnormal_max_spread_ticks", "max_event_rate_hz",

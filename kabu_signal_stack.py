@@ -400,7 +400,9 @@ class SignalConfig:
     ev_min_ticks: float = 0.1
 
     # Fill probability / maker-taker mode
-    maker_preferred_spread_ticks: float = 2.0
+    # v8 fix: lowered 2.0→1.0 so QUEUE mode (1-tick spread) qualifies as MAKER.
+    # With strict_entry_advantage=True this was blocking ALL entries in QUEUE markets.
+    maker_preferred_spread_ticks: float = 1.0
     maker_adverse_sel_ratio: float = 0.3
 
     # Signal windows
@@ -418,7 +420,9 @@ class SignalConfig:
     whale_short: float = 0.3          # whale_ofi threshold for short alpha count
 
     # Trade lag gate
-    max_trade_lag_sec: float = 8.0    # 0=disabled; block entry if no trade for this many seconds
+    # v8 fix: disabled by default (0.0). TSE stocks can go 10+ seconds without a print
+    # in quiet afternoon periods, causing g_trade_lag_ok=False and blocking all entries.
+    max_trade_lag_sec: float = 0.0    # 0=disabled; block entry if no trade for this many seconds
 
     # Per-signal entry thresholds (alpha-count voting)
     microprice_tilt_long: float = 0.3
@@ -1414,7 +1418,10 @@ if _VNPY_AVAILABLE:
         signal_confirm_expire_sec: float = 1.0
         entry_cooldown_sec: float = 0.4
         no_new_entry_after: str = "15:24:00"
-        noise_regime_block: bool = True
+        # v8 fix: disabled by default. Logs showed regime=NOISE 100% of the time for
+        # low-pricetick stocks (e.g. 2000 JPY / 1 JPY tick), blocking all entries even
+        # with edge=+9.85. Signal gates (alpha≥2, edge≥2.5) provide sufficient filtering.
+        noise_regime_block: bool = False
         spread_edge_penalty: float = 0.4
 
         # Dynamic sizing
@@ -3234,9 +3241,20 @@ if _VNPY_AVAILABLE:
                 or (dt - self._last_log_dt).total_seconds() >= self.log_interval_seconds
             ):
                 self._last_log_dt = dt
+                sig = self.sig
+                gate_str = (
+                    f"g[sp/liq/vol/tm/ev/lag]="
+                    f"{int(sig.g_spread_ok)}/"
+                    f"{int(sig.g_liq_ok)}/"
+                    f"{int(sig.g_vol_ok)}/"
+                    f"{int(sig.g_time_ok)}/"
+                    f"{int(sig.g_ev_ok)}/"
+                    f"{int(sig.g_trade_lag_ok)}"
+                )
                 self.write_log(
                     f"{self.sig.summary()} | "
                     f"mkt={self._market_state.value}:{self._market_state_reason} "
+                    f"{gate_str} "
                     f"pnl={self.daily_pnl:.0f}JPY dd={self.daily_drawdown:.0f} "
                     f"dtrades={self.daily_trades} total={self.total_trades} "
                     f"loss_streak={self.consecutive_losses}"

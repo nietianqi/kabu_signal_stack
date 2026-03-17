@@ -55,17 +55,27 @@ class ZNormalizer:
     """
 
     def __init__(self, lookback: int = 100) -> None:
-        self._buf: Deque[float] = deque(maxlen=max(10, lookback))
+        self._window = max(10, lookback)
+        self._min_samples = min(50, self._window)
+        self._buf: Deque[float] = deque(maxlen=self._window)
+        self._sum_x = 0.0
+        self._sum_x2 = 0.0
 
     def normalize(self, value: float) -> float:
+        if len(self._buf) == self._window:
+            old = self._buf[0]
+            self._sum_x -= old
+            self._sum_x2 -= old * old
         self._buf.append(value)
+        self._sum_x += value
+        self._sum_x2 += value * value
         n = len(self._buf)
-        if n < 10:
+        if n < self._min_samples:
             return 0.0
-        mean = sum(self._buf) / n
-        var  = sum((x - mean) ** 2 for x in self._buf) / n
-        std  = math.sqrt(max(var, 0.0))
-        return 0.0 if std < 1e-10 else (value - mean) / std
+        mean = self._sum_x / n
+        var  = max(0.0, self._sum_x2 / n - mean * mean)
+        std  = math.sqrt(var)
+        return 0.0 if std < 1e-10 else max(-4.0, min(4.0, (value - mean) / std))
 
 
 class FlowFlipDetector:
@@ -396,8 +406,19 @@ class SignalConfig:
     # Signal windows
     obi_levels: int = 5          # Weighted OBI: number of order book levels
     lob_ofi_window: int = 20
+    lob_ofi_depth: int = 5       # Multi-level LOB-OFI: number of levels
+    lob_ofi_decay: float = 0.80  # Exponential decay weight per level
     tape_window_sec: float = 1.0
     momentum_window: int = 10
+
+    # Whale pressure signal
+    whale_qty_threshold: int = 1000   # Minimum trade size to count as whale
+    w_whale: float = 0.5              # Weight in edge score composite
+    whale_long: float = 0.3           # whale_ofi threshold for long alpha count
+    whale_short: float = 0.3          # whale_ofi threshold for short alpha count
+
+    # Trade lag gate
+    max_trade_lag_sec: float = 8.0    # 0=disabled; block entry if no trade for this many seconds
 
     # Per-signal entry thresholds (alpha-count voting)
     microprice_tilt_long: float = 0.3
@@ -660,6 +681,21 @@ class KabuSignalStack:
         self.vwap_signal: float = 0.0       # +1 = price well below VWAP (buy), -1 = above VWAP (sell)
         self.book_depth_ratio: float = 0.0  # full-depth unweighted book imbalance
         self.flow_flip: bool = False         # True when momentum exhaustion flip is detected
+        self.whale_ofi: float = 0.0          # whale pressure signal [-1, +1]
+
+        # v7: multi-level LOB-OFI config
+        self._lob_ofi_depth: int = max(1, config.lob_ofi_depth)
+        self._lob_ofi_decay: float = max(0.0, min(1.0, config.lob_ofi_decay))
+
+        # v7: whale pressure accumulators (rolling window)
+        self._whale_buy_vol: float = 0.0
+        self._whale_sell_vol: float = 0.0
+        self._whale_q: Deque[Tuple[datetime, float]] = deque(maxlen=2048)
+
+        # v7: trade lag tracking
+        self._last_trade_price: float = 0.0
+        self._last_trade_dt: Optional[datetime] = None
+        self.g_trade_lag_ok: bool = True
 
         # VWAP cumulative accumulators (reset each session day)
         self._sess_vol: float = 0.0
@@ -668,7 +704,7 @@ class KabuSignalStack:
 
         # Signal z-score normalizers (one per signal to account for scale differences)
         _znorm_keys = ("obi", "lob_ofi", "tape_ofi", "momentum",
-                       "microprice_tilt", "vwap_signal", "book_depth_ratio")
+                       "microprice_tilt", "vwap_signal", "book_depth_ratio", "whale")
         self._znorm: Dict[str, ZNormalizer] = {
             k: ZNormalizer(config.znorm_lookback) for k in _znorm_keys
         }
@@ -729,6 +765,7 @@ class KabuSignalStack:
         self._update_gate_liq(snap)
         self._update_gate_vol(snap, now)
         self._update_gate_time(now)
+        self._update_gate_trade_lag(snap, now)
 
         self._update_obi(snap)
         self._update_microprice(snap)
@@ -753,6 +790,7 @@ class KabuSignalStack:
             and self.g_vol_ok
             and self.g_time_ok
             and self.g_ev_ok
+            and self.g_trade_lag_ok
         )
 
     def can_open_long(self, pos_skew: float = 0.0) -> bool:
@@ -818,6 +856,8 @@ class KabuSignalStack:
             "sig_vwap":           float(self.vwap_signal),
             "sig_book_depth":     float(self.book_depth_ratio),
             "sig_flow_flip":      int(self.flow_flip),
+            "sig_whale_ofi":      float(self.whale_ofi),
+            "g_trade_lag_ok":     int(self.g_trade_lag_ok),
         }
 
     # ------------------------------------------------------------------
@@ -887,8 +927,37 @@ class KabuSignalStack:
             self._lob_q.append(0.0)
             self.lob_ofi = 0.0
             return
-        delta = calc_lob_ofi_incremental(self._prev_snap, snap)
-        self._lob_q.append(delta)
+        prev = self._prev_snap
+        score = 0.0
+        decay = self._lob_ofi_decay
+        for i in range(self._lob_ofi_depth):
+            w = decay ** i
+            bc = snap.bids[i] if i < len(snap.bids) else None
+            bp = prev.bids[i] if i < len(prev.bids) else None
+            if bc and not bp:
+                bid_delta = float(bc[1])
+            elif bp and not bc:
+                bid_delta = -float(bp[1])
+            elif bc and bp:
+                if bc[0] > bp[0]:   bid_delta = float(bc[1])
+                elif bc[0] < bp[0]: bid_delta = -float(bp[1])
+                else:               bid_delta = float(bc[1] - bp[1])
+            else:
+                bid_delta = 0.0
+            ac = snap.asks[i] if i < len(snap.asks) else None
+            ap = prev.asks[i] if i < len(prev.asks) else None
+            if ac and not ap:
+                ask_delta = float(ac[1])
+            elif ap and not ac:
+                ask_delta = -float(ap[1])
+            elif ac and ap:
+                if ac[0] < ap[0]:   ask_delta = float(ac[1])
+                elif ac[0] > ap[0]: ask_delta = -float(ap[1])
+                else:               ask_delta = float(ac[1] - ap[1])
+            else:
+                ask_delta = 0.0
+            score += w * (bid_delta - ask_delta)
+        self._lob_q.append(score)
         scale = max(1.0, sum(abs(x) for x in self._lob_q) / max(1, len(self._lob_q)))
         self.lob_ofi = sum(self._lob_q) / (scale * max(1, len(self._lob_q)))
 
@@ -913,6 +982,19 @@ class KabuSignalStack:
         self._compute_tape()
         # Update flow flip detector (convert float aggressor to int direction)
         self.flow_flip = self._flow_flip_det.update(int(round(aggr)))
+        # v7: update trade lag tracker
+        if snap.last_price != self._last_trade_price and snap.last_price > 0:
+            self._last_trade_price = snap.last_price
+            self._last_trade_dt = now
+        # v7: update whale pressure signal
+        if delta_vol >= self.cfg.whale_qty_threshold:
+            buy_v = delta_vol if aggr > 0 else 0.0
+            sell_v = delta_vol if aggr < 0 else 0.0
+            self._whale_buy_vol += buy_v
+            self._whale_sell_vol += sell_v
+            self._whale_q.append((now, buy_v - sell_v))
+        self._expire_whale(now)
+        self._compute_whale()
 
     def _expire_tape(self, now: datetime) -> None:
         cutoff = now.timestamp() - max(0.1, self.cfg.tape_window_sec)
@@ -927,6 +1009,33 @@ class KabuSignalStack:
         sells = -sum(v for _, v in self._tape_q if v < 0)
         total = buys + sells
         self.tape_ofi = 0.0 if total <= 0 else (buys - sells) / total
+
+    def _expire_whale(self, now: datetime) -> None:
+        cutoff = now.timestamp() - max(0.1, self.cfg.tape_window_sec)
+        while self._whale_q and self._whale_q[0][0].timestamp() < cutoff:
+            _, net = self._whale_q.popleft()
+            if net > 0:
+                self._whale_buy_vol -= net
+            else:
+                self._whale_sell_vol -= (-net)
+        self._whale_buy_vol = max(0.0, self._whale_buy_vol)
+        self._whale_sell_vol = max(0.0, self._whale_sell_vol)
+
+    def _compute_whale(self) -> None:
+        total = self._whale_buy_vol + self._whale_sell_vol
+        self.whale_ofi = 0.0 if total <= 0 else (self._whale_buy_vol - self._whale_sell_vol) / total
+
+    def _update_gate_trade_lag(self, snap: TickSnapshot, now: datetime) -> None:
+        """Block entry when no trades have printed for max_trade_lag_sec (Tape-OFI unreliable)."""
+        lag_sec = self.cfg.max_trade_lag_sec
+        if lag_sec <= 0:
+            self.g_trade_lag_ok = True
+            return
+        if self._last_trade_dt is None:
+            self.g_trade_lag_ok = True
+            return
+        elapsed = (now - self._last_trade_dt).total_seconds()
+        self.g_trade_lag_ok = elapsed < lag_sec
 
     def _update_momentum(self, snap: TickSnapshot) -> None:
         self._mom_q.append(snap.microprice)
@@ -1061,6 +1170,7 @@ class KabuSignalStack:
         z_obi   = zn["obi"].normalize(self.obi)
         z_vwap  = zn["vwap_signal"].normalize(self.vwap_signal)
         z_bdr   = zn["book_depth_ratio"].normalize(self.book_depth_ratio)
+        z_whale = zn["whale"].normalize(self.whale_ofi)
 
         self.edge_score = (
             cfg.w_microprice  * z_tilt
@@ -1070,6 +1180,7 @@ class KabuSignalStack:
             + cfg.w_obi       * z_obi
             + cfg.w_vwap      * z_vwap
             + cfg.w_book_depth * z_bdr
+            + cfg.w_whale     * z_whale
         )
 
         # Alpha-count uses raw values (threshold semantics defined in raw units)
@@ -1088,6 +1199,8 @@ class KabuSignalStack:
         if self.vwap_signal <= -cfg.vwap_short:                sc += 1
         if self.book_depth_ratio >= cfg.book_depth_long:       lc += 1
         if self.book_depth_ratio <= -cfg.book_depth_short:     sc += 1
+        if self.whale_ofi >= cfg.whale_long:                   lc += 1
+        if self.whale_ofi <= -cfg.whale_short:                 sc += 1
         self.alpha_long_count  = lc
         self.alpha_short_count = sc
 
@@ -1285,10 +1398,10 @@ if _VNPY_AVAILABLE:
 
         # Exit parameters
         profit_ticks: float = 3.0
-        loss_ticks: float = 2.0
+        loss_ticks: float = 999.0            # v7: effectively disabled; use max_loss_per_trade_jpy
         max_hold_seconds: float = 30.0
         open_order_timeout_sec: float = 3.0
-        close_order_timeout_sec: float = 2.0
+        close_order_timeout_sec: float = 5.0  # v7: wider timeout for non-TP close orders
         taker_exit_extra_ticks: float = 0.0
         trailing_activate_ticks: float = 2.0
         trailing_drawdown_ticks: float = 1.2
@@ -1349,15 +1462,17 @@ if _VNPY_AVAILABLE:
 
         # Entry edge discipline
         strict_entry_advantage: bool = True      # Only open when the quoted price is favorable.
-        min_entry_edge_ticks: float = 1.0        # Minimum fair-value edge in ticks required for entry.
+        min_entry_edge_ticks: float = 2.0        # v7: must cover auto_tp_ticks=2 by default
 
         # Auto-TP on fill
         auto_tp_on_fill: bool = True             # When True: place limit TP close order immediately
                                                  # when open fill is confirmed (vs waiting for next tick)
         auto_tp_ticks: float = 2.0               # TP price offset in ticks from fill price
                                                  # LONG: fill + auto_tp_ticks*pt; SHORT: fill - auto_tp_ticks*pt
-        auto_tp_retry_max: int = 8              # retry count when immediate TP submit is blocked/rejected
-        auto_tp_retry_delay_sec: float = 0.3     # retry delay for pending TP submit queue
+        auto_tp_retry_max: int = 15             # total retry count (fast + slow phases)
+        auto_tp_retry_delay_sec: float = 0.3     # retry delay for fast phase
+        auto_tp_fast_retries: int = 5            # first N retries use auto_tp_retry_delay_sec (fast)
+        auto_tp_slow_retry_sec: float = 30.0     # interval for slow phase retries (after fast exhausted)
 
         # Feed stale watchdog
         max_tick_stale_seconds: float = 5.0      # 0 disables stale-feed watchdog
@@ -1369,11 +1484,11 @@ if _VNPY_AVAILABLE:
 
         # --- v5 parameters ---
         # Per-trade JPY emergency stop (from reference strategy)
-        max_loss_per_trade_jpy: float = 0.0      # 0=disabled; emergency flat when unrealized_pnl < -this
-                                                  # Works even when hold_if_loss=True (hard floor)
+        max_loss_per_trade_jpy: float = 100_000.0  # v7: 10万円 hard floor; works with hold_if_loss=True
 
         # Verbose logging control (from reference strategy)
         verbose_log: bool = False                 # True: output detailed debug logs (rate-limit reasons, etc.)
+        near_miss_log: bool = True               # True: log [NEAR♦] when signal reaches 60% of threshold (requires verbose_log)
 
         # --- v6 parameters (integrated from kabu_hft_new ideas) ---
         # Market state detector
@@ -1392,6 +1507,12 @@ if _VNPY_AVAILABLE:
         max_fair_shift_ticks: float = 3.0        # cap fair shift in ticks
         inventory_skew_ticks: float = 1.0        # inventory penalty in ticks
         max_fair_drift_ticks: float = 1.5        # cancel pending entry when fair drift too far
+
+        # --- v7 parameters ---
+        # TP order persistence (hold_if_loss mode)
+        tp_order_timeout_sec: float = 300.0      # TP limit order max wait time; 0=infinite
+        # Entry quality: fair-value coverage beyond TP target
+        min_fair_tp_coverage_ticks: float = 0.0  # extra safety margin (0=exact coverage required)
 
         parameters = [
             "trade_volume", "max_position",
@@ -1435,6 +1556,8 @@ if _VNPY_AVAILABLE:
             "close_only_before_break_min",
             "fair_value_beta", "max_fair_shift_ticks",
             "inventory_skew_ticks", "max_fair_drift_ticks",
+            # v7
+            "tp_order_timeout_sec", "min_fair_tp_coverage_ticks",
         ]
 
         # --- UI-visible variables ---
@@ -1463,6 +1586,8 @@ if _VNPY_AVAILABLE:
         sig_vwap: float = 0.0
         sig_book_depth: float = 0.0
         sig_flow_flip: int = 0
+        sig_whale_ofi: float = 0.0
+        g_trade_lag_ok: int = 1
         unrealized_pnl: float = 0.0
         stat_win_rate: float = 0.0
         stat_pf: float = 0.0
@@ -1481,7 +1606,8 @@ if _VNPY_AVAILABLE:
             "last_entry_price", "last_exit_price",
             "daily_pnl", "daily_trades", "consecutive_losses", "daily_drawdown",
             "risk_halt_reason", "order_req_1s", "total_trades", "last_signal",
-            "sig_vwap", "sig_book_depth", "sig_flow_flip", "unrealized_pnl",
+            "sig_vwap", "sig_book_depth", "sig_flow_flip",
+            "sig_whale_ofi", "g_trade_lag_ok", "unrealized_pnl",
             "stat_win_rate", "stat_pf", "stat_avg_hold",
             "market_state", "market_reason", "market_event_rate_hz", "market_jump_ticks",
         ]
@@ -1560,6 +1686,10 @@ if _VNPY_AVAILABLE:
             # v5: periodic pricetick verification
             self._price_tick_verified: bool = False
             self._last_price_tick_check_dt: Optional[datetime] = None
+
+            # v7: ATR-based volatility estimator
+            self._atr: float = 0.0
+            self._prev_mid_for_atr: float = 0.0
 
         # ------------------------------------------------------------------
         # Lifecycle
@@ -1726,6 +1856,13 @@ if _VNPY_AVAILABLE:
             self._periodic_verify_price_tick(tick_dt)
             self._update_market_state(snap, tick_dt)
 
+            # v7: ATR update (EMA of true range for volatility-based sizing)
+            if self._prev_mid_for_atr > 0:
+                move = abs(snap.mid - self._prev_mid_for_atr)
+                tr = max(move, snap.ask1 - snap.bid1)
+                self._atr = 0.05 * tr + 0.95 * (self._atr if self._atr > 0 else tr)
+            self._prev_mid_for_atr = snap.mid
+
             self._sync_sig_vars(tick_dt)
             self._update_unrealized_pnl(snap)
             self._check_date_reset(tick_dt)
@@ -1794,6 +1931,33 @@ if _VNPY_AVAILABLE:
                 self._signal_pending_dir = 0
                 self._signal_pending_count = 0
                 self._signal_pending_dt = None
+                # [NEAR♦] near-miss diagnostic: show bottleneck when signal is ≥60% of threshold
+                if self.near_miss_log and self.verbose_log and self.sig.all_gates_ok:
+                    _edge = self.sig.edge_score
+                    _eth_l = self.sig.cfg.edge_score_long_threshold
+                    _eth_s = self.sig.cfg.edge_score_short_threshold
+                    _al = self.sig.alpha_long_count
+                    _as = self.sig.alpha_short_count
+                    _amin = self.sig.cfg.min_alpha_count
+                    _r_el = _edge / _eth_l if _eth_l > 0 else 0.0
+                    _r_es = (-_edge) / _eth_s if _eth_s > 0 else 0.0
+                    _r_al = _al / _amin if _amin > 0 else 0.0
+                    _r_as = _as / _amin if _amin > 0 else 0.0
+                    _ml = max(_r_el, _r_al)
+                    _ms = max(_r_es, _r_as)
+                    if max(_ml, _ms) >= 0.6:
+                        if _ml >= _ms:
+                            _w = "alpha" if _r_al < _r_el else "edge"
+                            self._vlog(
+                                f"[NEAR♦多] edge={_edge:+.2f}/{_eth_l:.2f}({_r_el*100:.0f}%) "
+                                f"alpha={_al}/{_amin}({_r_al*100:.0f}%) → 瓶颈:{_w}"
+                            )
+                        else:
+                            _w = "alpha" if _r_as < _r_es else "edge"
+                            self._vlog(
+                                f"[NEAR♦空] edge={_edge:+.2f}/{-_eth_s:.2f}({_r_es*100:.0f}%) "
+                                f"alpha={_as}/{_amin}({_r_as*100:.0f}%) → 瓶颈:{_w}"
+                            )
 
             self._throttled_put_event(tick_dt)
 
@@ -2024,20 +2188,30 @@ if _VNPY_AVAILABLE:
             if self.auto_tp_retry_max <= 0:
                 self._clear_pending_auto_tp()
                 return
-            self._pending_tp_submit = True
-            self._pending_tp_price = float(price)
-            self._pending_tp_volume = max(0, int(volume))
-            self._pending_tp_after = now + timedelta(seconds=max(0.05, self.auto_tp_retry_delay_sec))
             self._pending_tp_retries += 1
             if self._pending_tp_retries > self.auto_tp_retry_max:
+                _slow_max = self.auto_tp_retry_max - self.auto_tp_fast_retries
                 self.write_log(
-                    f"[WARN] AUTO TP retry exhausted ({self._pending_tp_retries - 1}/{self.auto_tp_retry_max})"
+                    f"[WARN] AUTO TP retry exhausted "
+                    f"快速×{self.auto_tp_fast_retries}+慢速×{_slow_max}"
                 )
                 self._clear_pending_auto_tp()
                 return
+            self._pending_tp_submit = True
+            self._pending_tp_price = float(price)
+            self._pending_tp_volume = max(0, int(volume))
+            if self._pending_tp_retries <= self.auto_tp_fast_retries:
+                delay = max(0.05, self.auto_tp_retry_delay_sec)
+                _phase = f"快速{self._pending_tp_retries}/{self.auto_tp_fast_retries}"
+            else:
+                delay = self.auto_tp_slow_retry_sec
+                _sn = self._pending_tp_retries - self.auto_tp_fast_retries
+                _sm = self.auto_tp_retry_max - self.auto_tp_fast_retries
+                _phase = f"慢速{_sn}/{_sm}"
+            self._pending_tp_after = now + timedelta(seconds=delay)
             self.write_log(
-                f"[WARN] AUTO TP pending retry {self._pending_tp_retries}/{self.auto_tp_retry_max} "
-                f"after {max(0.05, self.auto_tp_retry_delay_sec):.2f}s"
+                f"[WARN] AUTO TP pending {_phase} after {delay:.1f}s "
+                f"px={price:.1f} vol={volume}"
             )
 
         def _try_retry_pending_auto_tp(self, now: datetime) -> None:
@@ -2089,8 +2263,14 @@ if _VNPY_AVAILABLE:
                 self._state_since = now
                 self.order_state = OrderState.PENDING_CLOSE.value
                 self._pending_exit_reason = "TP"
+                _n = self._pending_tp_retries
+                _phase = (
+                    f"快速{_n}/{self.auto_tp_fast_retries}"
+                    if _n <= self.auto_tp_fast_retries
+                    else f"慢速{_n - self.auto_tp_fast_retries}/{self.auto_tp_retry_max - self.auto_tp_fast_retries}"
+                )
                 self._clear_pending_auto_tp()
-                self.write_log(f"AUTO TP retry success @ {price:.1f} x{vol}")
+                self.write_log(f"AUTO TP retry success [{_phase}] @ {price:.1f} x{vol}")
                 return
 
             self._schedule_auto_tp_retry(now, price, vol)
@@ -2599,6 +2779,18 @@ if _VNPY_AVAILABLE:
                     self._state_since = now
                 return
 
+            # --- TP order exemption: when hold_if_loss=True, the TP limit order must
+            # keep resting until filled or until tp_order_timeout_sec expires.
+            # This prevents the 2-5s close_order_timeout from cancelling valid TP orders. ---
+            if (
+                self._order_state == OrderState.PENDING_CLOSE
+                and self._pending_exit_reason == "TP"
+                and self.hold_if_loss
+            ):
+                tp_timeout = getattr(self, "tp_order_timeout_sec", 300.0)
+                if tp_timeout <= 0 or elapsed < tp_timeout:
+                    return  # let TP limit order rest; do not cancel
+
             # --- Close timeout: aggressive TAKER retry (bid1 / ask1, no offset) ---
             if self._order_state == OrderState.PENDING_CLOSE and elapsed >= self.close_order_timeout_sec:
                 self.write_log(
@@ -2827,6 +3019,15 @@ if _VNPY_AVAILABLE:
 
             raw = int(base * strength_scale * dd_scale * loss_scale)
             raw = max(self.min_trade_volume, min(self.max_trade_volume, raw))
+
+            # v7: ATR volatility gate — halve size when ATR exceeds 2.5× normal
+            snap = self._last_snap
+            if snap is not None and self._atr > 0 and snap.mid > 0:
+                pt = max(self.price_tick, 1e-9)
+                atr_ticks = self._atr / pt
+                if atr_ticks > 2.5:
+                    raw = max(self.min_trade_volume, raw // 2)
+
             headroom = max(0, int(self.max_position) - abs(int(self.pos)))
             raw = min(raw, headroom)
             lot = max(1, self.lot_size)
@@ -2869,6 +3070,21 @@ if _VNPY_AVAILABLE:
             if vol > 0 and self.max_impact_pct > 0:
                 best_vol = snap.ask_vol1 if direction > 0 else snap.bid_vol1
                 if best_vol > 0 and vol / best_vol > self.max_impact_pct:
+                    return False
+
+            # v7: TP coverage check — fair value must cover TP target.
+            # Ensures every entry price has a positive expected exit via auto-TP.
+            if self.auto_tp_on_fill and self.auto_tp_ticks > 0:
+                min_coverage = self.auto_tp_ticks + getattr(self, "min_fair_tp_coverage_ticks", 0.0)
+                tp_coverage_ticks = (
+                    (fair_price - order_price) / pt if direction > 0
+                    else (order_price - fair_price) / pt
+                )
+                if tp_coverage_ticks < min_coverage:
+                    self._vlog(
+                        f"[ENTRY REJECT] fair_tp_coverage={tp_coverage_ticks:.2f} "
+                        f"< required={min_coverage:.2f}"
+                    )
                     return False
 
             return True

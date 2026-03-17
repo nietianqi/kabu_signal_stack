@@ -531,31 +531,56 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # =========================
     # price_tick 自动纠偏
     # =========================
-    def _periodic_verify_price_tick(self):
-        """周期性验证 price_tick（每30秒检查一次，避免 fallback=1.0 伪装）"""
-        # 如果已经验证过，跳过（减少开销）
-        if self._price_tick_verified:
-            return
+    def _periodic_verify_price_tick(self, live_price: float = 0.0):
+        """周期性验证 price_tick（每30秒检查一次）。
 
+        优先顺序：
+        1. 合约 pricetick > 1.0 → 直接采用，标记已验证
+        2. 合约 pricetick == 1.0 且 live_price ≥ 3000 → TSE 呼値表推断
+        3. 合约不可用 且 live_price > 0 → TSE 呼値表推断
+        """
         now = datetime.now()
-        # 节流：每30秒检查一次
+        # 节流：每30秒检查一次（即使已验证也继续，避免价格跨级时不更新）
         if self._last_price_tick_check_time is not None:
             if (now - self._last_price_tick_check_time).total_seconds() < self.PRICE_TICK_VERIFY_INTERVAL:
                 return
 
         self._last_price_tick_check_time = now
 
+        inferred: float = 0.0
+        source = ""
         try:
             main_engine = self.cta_engine.main_engine
             contract = main_engine.get_contract(self.vt_symbol)
             if contract and hasattr(contract, 'pricetick') and contract.pricetick > 0:
                 contract_tick = float(contract.pricetick)
-                if self.price_tick != contract_tick:
-                    self.write_log(f"🔧 [自动纠偏] price_tick: {self.price_tick} → {contract_tick}")
-                    self.price_tick = contract_tick
-                self._price_tick_verified = True  # 标记已验证
+                if contract_tick > 1.0:
+                    # 合约明确给出非1.0值，直接可信
+                    inferred = contract_tick
+                    source = f"合约({contract_tick})"
+                    self._price_tick_verified = True
+                else:
+                    # contract_tick == 1.0：kabu gateway 默认值，需要 TSE 表二次确认
+                    if live_price >= 3_000:
+                        inferred = self._get_tse_pricetick(live_price)
+                        source = f"TSE表({live_price:.0f}→{inferred})"
+                        if inferred > 1.0:
+                            self._price_tick_verified = True
+                    else:
+                        inferred = contract_tick
+                        source = f"合约({contract_tick})"
+                        self._price_tick_verified = True
         except Exception:
-            pass  # 静默失败，下次再试
+            pass
+
+        # 没拿到合约但有实时价格，直接用 TSE 表
+        if inferred <= 0 and live_price > 0:
+            inferred = self._get_tse_pricetick(live_price)
+            source = f"TSE表-fallback({live_price:.0f}→{inferred})"
+
+        if inferred > 0 and inferred != self.price_tick:
+            self.write_log(f"🔧 [price_tick纠偏] {self.price_tick} → {inferred}  来源:{source}")
+            self.price_tick = inferred
 
     # =========================
     # 日志辅助
@@ -624,8 +649,11 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self.last_recv_time = datetime.now()
         self._tick_stale_state = False
 
-        # ⚠️ 新增：周期性验证 price_tick（避免 fallback=1.0 伪装，每30秒检查一次）
-        self._periodic_verify_price_tick()
+        # ⚠️ 周期性验证 price_tick：传入实时价格以触发 TSE 表推断（修复 contract.pricetick=1.0 伪装）
+        _live_px = float(getattr(tick_used, "last_price", 0.0) or 0.0)
+        if _live_px <= 0:
+            _live_px = float(getattr(tick_used, "bid_price_1", 0.0) or 0.0)
+        self._periodic_verify_price_tick(live_price=_live_px)
 
         self._check_new_day(tick_used.datetime)
         self._update_indicators(tick_used)
@@ -758,10 +786,18 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 self._limit_tp_order_ids.clear()
 
                 # 2. 计算止盈价（使用加权平均成交价 + 1tick）
-                pt = self.price_tick if self.price_tick > 0 else 1.0
+                # ⚠️ 用 TSE 表二次确认价位：避免 contract.pricetick=1.0 伪装导致非法价位（如 3256 而非 3260）
+                pt_contract = self.price_tick if self.price_tick > 0 else 1.0
+                pt_tse = self._get_tse_pricetick(self.entry_price)
+                pt = max(pt_contract, pt_tse)  # 取较大值（更保守，确保合法）
+                if pt != pt_contract:
+                    self.write_log(
+                        f"⚠️ [TP价位] 合约pricetick={pt_contract} 但TSE表推断={pt_tse}，"
+                        f"将使用 {pt}¥ 计算TP（原合约值可能不可信）"
+                    )
 
                 if self.entry_direction == Direction.LONG:
-                    # 多头：成本价 + 1tick
+                    # 多头：成本价 + 1tick（确保对齐到 TSE 合法价位）
                     tp_price = self.entry_price + self.limit_tp_ticks * pt
                     tp_price = round(tp_price / pt) * pt  # 对齐到最小变动价位
 
@@ -2128,9 +2164,14 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             )
             # 设置下次慢速重试时间
             self._limit_tp_submit_after = datetime.now() + timedelta(seconds=30)
-            # 重置轮询状态（让建玉轮询重新检查）
-            self._position_poll_start_time = None
-            self._last_position_poll_time = None
+            # ✅ Bug修复：不能将 _position_poll_start_time 设为 None，否则轮询块会初始化
+            # _last_position_poll_time=now，导致 poll_elapsed=0 < poll_interval 而直接 return，
+            # 使 TP 单永远不会发出，计数器永远停在 1/10。
+            # 正确做法：将 start_time 设为"已超时"状态，强制跳到提交阶段。
+            self._position_poll_start_time = datetime.now() - timedelta(
+                seconds=self.max_position_wait_seconds + 1
+            )
+            self._last_position_poll_time = None  # 允许立即执行一次轮询
 
         now = datetime.now()
 
@@ -2170,8 +2211,19 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             if not self._allow_order_action(now):
                 return
 
-        # 提交订单
+        # 提交订单（先做价位合法性校验，防止非法价格反复被拒单）
         try:
+            # ⚠️ 每次提交前用 TSE 表重验价位：
+            # 若 _pending_tp_price 不是合法价位（如 3256 而非 3260），自动纠正
+            _pt_ref = self._get_tse_pricetick(self._pending_tp_price)
+            _snapped = round(self._pending_tp_price / _pt_ref) * _pt_ref
+            if abs(_snapped - self._pending_tp_price) > 0.01:
+                self.write_log(
+                    f"🔧 [TP价位校正] {self._pending_tp_price:.0f} → {_snapped:.0f}"
+                    f" (TSE pricetick={_pt_ref}¥，原价非法)"
+                )
+                self._pending_tp_price = _snapped
+
             if self._pending_tp_direction == Direction.SHORT:
                 # 多头平仓止盈
                 _tp_est = (self._pending_tp_price - self.entry_price) * self._pending_tp_volume if self.entry_price > 0 else 0.0
@@ -2518,14 +2570,52 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self._long_confirm = 0
         self._short_confirm = 0
 
+    # ------------------------------------------------------------------
+    # TSE 呼値単位（最小変動価格）標準テーブル
+    # 出典: JPX 呼値単位表（国内株式・標準）。実際の運用前に最新版を確認すること。
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _get_tse_pricetick(price: float) -> float:
+        """TSE 株価水準から正規の呼値単位を返す。
+        price < 3000  → 1¥
+        3000 ≤ price < 5000  → 5¥   ← 3000-4999 の銘柄 (例: 4483@3255)
+        5000 ≤ price < 30000 → 10¥
+        30000 ≤ price < 50000 → 50¥
+        50000 ≤ price < 100000 → 100¥
+        100000 ≤ price < 1000000 → 1000¥
+        ≥ 1000000 → 10000¥
+        """
+        if price <= 0:
+            return 1.0
+        if price < 3_000:
+            return 1.0
+        if price < 5_000:
+            return 5.0
+        if price < 30_000:
+            return 10.0
+        if price < 50_000:
+            return 50.0
+        if price < 100_000:
+            return 100.0
+        if price < 1_000_000:
+            return 1_000.0
+        return 10_000.0
+
     def _load_pricetick_or_fallback(self) -> float:
         try:
             main_engine = self.cta_engine.main_engine
             contract = main_engine.get_contract(self.vt_symbol)
             if contract and getattr(contract, "pricetick", 0) and contract.pricetick > 0:
-                # 成功从合约加载，标记已验证（含price_tick=1.0的正常情况）
+                ct = float(contract.pricetick)
+                # ⚠️ 合约返回 1.0 不一定可信（kabu gateway 默认值可能是 1.0）
+                # 若合约价位=1.0 且合约价格 ≥ 3000，用 TSE 表推断更可靠的值
+                if ct == 1.0:
+                    ref_price = float(getattr(contract, "min_volume", 0) or 0)
+                    # min_volume 字段不是价格；用 TSE 默认推断
+                    # 先标记未验证，等第一个 tick 到来时用实时价格推断
+                    return ct  # 先用合约值，后续 _periodic_verify_price_tick 纠偏
                 self._price_tick_verified = True
-                return float(contract.pricetick)
+                return ct
         except Exception:
             pass
         # fallback=1.0，未经合约验证，不设_price_tick_verified标志

@@ -1388,8 +1388,10 @@ if _VNPY_AVAILABLE:
         reverse_bid_ask: bool = False   # Set True if kabu gateway passes raw field names
         auto_fix_negative_spread: bool = True
         auto_fix_negative_spread_max_ticks: float = 3.0
-        # Prefer contract pricetick from gateway; keep auto inference off by default.
-        auto_pricetick: bool = False
+        # ⚠️ 开启 TSE 表自动推断：kabu gateway 对部分股票 contract.pricetick=1.0 不可信。
+        # auto_pricetick=True 时，每 tick 从 last_price 调用 get_tse_pricetick() 更新。
+        # 同时也使 auto_fix_negative_spread 的 spread_ticks 计算更准确（如 4483 spread=5¥/5tick=1，不会被误过滤）
+        auto_pricetick: bool = True
 
         # Commission 遯ｶ繝ｻkabu ad-valorem model (鬩幢ｽｽ陟趣ｽｦ隰・玄辟夊ｭ√・
         # IMPORTANT: confirm against your actual account plan before live trading.
@@ -1543,11 +1545,12 @@ if _VNPY_AVAILABLE:
             "strict_entry_advantage", "min_entry_edge_ticks",
             "auto_tp_on_fill", "auto_tp_ticks",
             "auto_tp_retry_max", "auto_tp_retry_delay_sec",
+            "auto_tp_fast_retries", "auto_tp_slow_retry_sec",
             "smart_cancel_on_flip",
             "max_tick_stale_seconds", "stale_feed_force_flatten",
             # v5
             "max_loss_per_trade_jpy",
-            "verbose_log",
+            "verbose_log", "near_miss_log",
             # v6
             "stale_quote_ms", "queue_spread_max_ticks",
             "abnormal_max_spread_ticks", "max_event_rate_hz",

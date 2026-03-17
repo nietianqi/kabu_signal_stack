@@ -401,9 +401,12 @@ class SignalConfig:
 
     # Fill probability / maker-taker mode
     # v8 fix: lowered 2.0→1.0 so QUEUE mode (1-tick spread) qualifies as MAKER.
-    # With strict_entry_advantage=True this was blocking ALL entries in QUEUE markets.
+    # v8 fix: raised 0.3→1.5 to disable adverse-selection gate for MAKER preference.
+    #   microprice_tilt in QUEUE mode is typically 0.3-0.8 (bid vol >> ask vol when
+    #   long signal is strong). The old 0.3 threshold blocked MAKER mode on the exact
+    #   ticks where we WANT to buy, defeating strict_entry_advantage=True.
     maker_preferred_spread_ticks: float = 1.0
-    maker_adverse_sel_ratio: float = 0.3
+    maker_adverse_sel_ratio: float = 1.5
 
     # Signal windows
     obi_levels: int = 5          # Weighted OBI: number of order book levels

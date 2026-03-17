@@ -1469,8 +1469,10 @@ if _VNPY_AVAILABLE:
                                                  # when open fill is confirmed (vs waiting for next tick)
         auto_tp_ticks: float = 2.0               # TP price offset in ticks from fill price
                                                  # LONG: fill + auto_tp_ticks*pt; SHORT: fill - auto_tp_ticks*pt
-        auto_tp_retry_max: int = 8              # retry count when immediate TP submit is blocked/rejected
-        auto_tp_retry_delay_sec: float = 0.3     # retry delay for pending TP submit queue
+        auto_tp_retry_max: int = 15             # total retry count (fast + slow phases)
+        auto_tp_retry_delay_sec: float = 0.3     # retry delay for fast phase
+        auto_tp_fast_retries: int = 5            # first N retries use auto_tp_retry_delay_sec (fast)
+        auto_tp_slow_retry_sec: float = 30.0     # interval for slow phase retries (after fast exhausted)
 
         # Feed stale watchdog
         max_tick_stale_seconds: float = 5.0      # 0 disables stale-feed watchdog
@@ -1486,6 +1488,7 @@ if _VNPY_AVAILABLE:
 
         # Verbose logging control (from reference strategy)
         verbose_log: bool = False                 # True: output detailed debug logs (rate-limit reasons, etc.)
+        near_miss_log: bool = True               # True: log [NEAR♦] when signal reaches 60% of threshold (requires verbose_log)
 
         # --- v6 parameters (integrated from kabu_hft_new ideas) ---
         # Market state detector
@@ -1928,6 +1931,33 @@ if _VNPY_AVAILABLE:
                 self._signal_pending_dir = 0
                 self._signal_pending_count = 0
                 self._signal_pending_dt = None
+                # [NEAR♦] near-miss diagnostic: show bottleneck when signal is ≥60% of threshold
+                if self.near_miss_log and self.verbose_log and self.sig.all_gates_ok:
+                    _edge = self.sig.edge_score
+                    _eth_l = self.sig.cfg.edge_score_long_threshold
+                    _eth_s = self.sig.cfg.edge_score_short_threshold
+                    _al = self.sig.alpha_long_count
+                    _as = self.sig.alpha_short_count
+                    _amin = self.sig.cfg.min_alpha_count
+                    _r_el = _edge / _eth_l if _eth_l > 0 else 0.0
+                    _r_es = (-_edge) / _eth_s if _eth_s > 0 else 0.0
+                    _r_al = _al / _amin if _amin > 0 else 0.0
+                    _r_as = _as / _amin if _amin > 0 else 0.0
+                    _ml = max(_r_el, _r_al)
+                    _ms = max(_r_es, _r_as)
+                    if max(_ml, _ms) >= 0.6:
+                        if _ml >= _ms:
+                            _w = "alpha" if _r_al < _r_el else "edge"
+                            self._vlog(
+                                f"[NEAR♦多] edge={_edge:+.2f}/{_eth_l:.2f}({_r_el*100:.0f}%) "
+                                f"alpha={_al}/{_amin}({_r_al*100:.0f}%) → 瓶颈:{_w}"
+                            )
+                        else:
+                            _w = "alpha" if _r_as < _r_es else "edge"
+                            self._vlog(
+                                f"[NEAR♦空] edge={_edge:+.2f}/{-_eth_s:.2f}({_r_es*100:.0f}%) "
+                                f"alpha={_as}/{_amin}({_r_as*100:.0f}%) → 瓶颈:{_w}"
+                            )
 
             self._throttled_put_event(tick_dt)
 
@@ -2158,20 +2188,30 @@ if _VNPY_AVAILABLE:
             if self.auto_tp_retry_max <= 0:
                 self._clear_pending_auto_tp()
                 return
-            self._pending_tp_submit = True
-            self._pending_tp_price = float(price)
-            self._pending_tp_volume = max(0, int(volume))
-            self._pending_tp_after = now + timedelta(seconds=max(0.05, self.auto_tp_retry_delay_sec))
             self._pending_tp_retries += 1
             if self._pending_tp_retries > self.auto_tp_retry_max:
+                _slow_max = self.auto_tp_retry_max - self.auto_tp_fast_retries
                 self.write_log(
-                    f"[WARN] AUTO TP retry exhausted ({self._pending_tp_retries - 1}/{self.auto_tp_retry_max})"
+                    f"[WARN] AUTO TP retry exhausted "
+                    f"快速×{self.auto_tp_fast_retries}+慢速×{_slow_max}"
                 )
                 self._clear_pending_auto_tp()
                 return
+            self._pending_tp_submit = True
+            self._pending_tp_price = float(price)
+            self._pending_tp_volume = max(0, int(volume))
+            if self._pending_tp_retries <= self.auto_tp_fast_retries:
+                delay = max(0.05, self.auto_tp_retry_delay_sec)
+                _phase = f"快速{self._pending_tp_retries}/{self.auto_tp_fast_retries}"
+            else:
+                delay = self.auto_tp_slow_retry_sec
+                _sn = self._pending_tp_retries - self.auto_tp_fast_retries
+                _sm = self.auto_tp_retry_max - self.auto_tp_fast_retries
+                _phase = f"慢速{_sn}/{_sm}"
+            self._pending_tp_after = now + timedelta(seconds=delay)
             self.write_log(
-                f"[WARN] AUTO TP pending retry {self._pending_tp_retries}/{self.auto_tp_retry_max} "
-                f"after {max(0.05, self.auto_tp_retry_delay_sec):.2f}s"
+                f"[WARN] AUTO TP pending {_phase} after {delay:.1f}s "
+                f"px={price:.1f} vol={volume}"
             )
 
         def _try_retry_pending_auto_tp(self, now: datetime) -> None:
@@ -2223,8 +2263,14 @@ if _VNPY_AVAILABLE:
                 self._state_since = now
                 self.order_state = OrderState.PENDING_CLOSE.value
                 self._pending_exit_reason = "TP"
+                _n = self._pending_tp_retries
+                _phase = (
+                    f"快速{_n}/{self.auto_tp_fast_retries}"
+                    if _n <= self.auto_tp_fast_retries
+                    else f"慢速{_n - self.auto_tp_fast_retries}/{self.auto_tp_retry_max - self.auto_tp_fast_retries}"
+                )
                 self._clear_pending_auto_tp()
-                self.write_log(f"AUTO TP retry success @ {price:.1f} x{vol}")
+                self.write_log(f"AUTO TP retry success [{_phase}] @ {price:.1f} x{vol}")
                 return
 
             self._schedule_auto_tp_retry(now, price, vol)

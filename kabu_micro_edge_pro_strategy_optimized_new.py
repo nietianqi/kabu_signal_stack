@@ -18,12 +18,33 @@
 # 12. 信号强度自适应确认: 强信号1次确认,弱信号2次
 # 13. 增量指标计算: LOB-OFI/Tape-OFI使用增量更新
 #
+# 🔬 信号结构重构 (v3) — 2026-03-17:
+# 14. 主信号从「book AND of AND mom」改为「book AND tape」
+#
+#   【根因】对 TSE QUEUE 模式股票（spread=1 tick，约占全天95%）的日志分析：
+#     - book（OBI，快照）与 of（LOB-OFI，增量）相关系数仅 0.17（近乎无关）
+#     - 当 book >= 0.35（大 bid 墙）时，of < 0 的概率高达 74%（大 bid 静止→OFI偏负）
+#     - mom（microprice方向）在 1-tick spread 市场几乎恒为 0（价格不动=方向=0）
+#     - 3个AND门全天通过率≈0%，实际入场仅靠开盘噪声触发
+#
+#   【新逻辑】主信号 = book（被动盘口厚度）AND tape（主动成交方向）
+#            次级信号 = of / mom / mpt 任满足 ≥ 1 个（阈值降低）
+#
+#   【理由】tape（实际成交）是 QUEUE 市场唯一可靠的主动买卖意图信号；
+#           of/mom/mpt 降为辅助验证，避免三者相互拮抗导致信号永远不触发。
+#
+#   【参数变化】
+#     of_imbalance_long/short:  0.25 → 0.10  (降为辅助阈值)
+#     mom_long/short_threshold: 0.25 → 0.10  (降为辅助阈值)
+#     tape_imbalance_long/short: 0.20 不变    (升为主信号，值已合适)
+#     book_imbalance_long/short: 0.35 不变    (仍为主信号)
+#
 # 主要信号:
-# 1) 加权盘口不平衡（多档深度）
-# 2) LOB-OFI（订单簿订单流不平衡）
-# 3) Tape-OFI（逐笔成交主动性）
-# 4) 微动量（microprice 方向滚动）
-# 5) Microprice tilt（microprice 相对 mid 的偏移）
+# 1) 加权盘口不平衡（多档深度）     ← v3 主信号 1
+# 2) Tape-OFI（逐笔成交主动性）     ← v3 主信号 2（从次级升为主级）
+# 3) LOB-OFI（订单簿订单流不平衡）  ← v3 次级信号（从主级降为次级）
+# 4) 微动量（microprice 方向滚动）  ← v3 次级信号（从主级降为次级）
+# 5) Microprice tilt（microprice 相对 mid 的偏移）  ← v3 次级信号（不变）
 
 from __future__ import annotations
 
@@ -159,30 +180,35 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # LOB-OFI 参数
     # =========================
     of_window_size: int = 18           # 优化: 从20调整到18
-    of_imbalance_long: float = 0.25    # 优化: 从0.22提高到0.25
-    of_imbalance_short: float = 0.25
+    # v3: 从主信号降为次级信号，阈值同步降低 0.25→0.10
+    # 原因: QUEUE市场中 of 与 book 相关性仅0.17，book强时of反而偏负(74%概率)
+    of_imbalance_long: float = 0.10    # v3: 0.25→0.10 (次级辅助阈值，旧值0.25为主信号阈值)
+    of_imbalance_short: float = 0.10   # v3: 0.25→0.10
 
     # =========================
     # Tape-OFI 参数
     # =========================
     use_tape_ofi: bool = True
     tape_window_seconds: float = 1.0   # 优化: 从0.5扩展到1.0，与LOB-OFI时间窗口对齐
-    tape_imbalance_long: float = 0.20  # 优化: 从0.18提高到0.20
-    tape_imbalance_short: float = 0.20
+    # v3: tape 升为主信号，阈值不变（0.20已适合做主信号门槛）
+    tape_imbalance_long: float = 0.20  # v3: 升为主信号（值不变，语义变化: 次级→主级）
+    tape_imbalance_short: float = 0.20 # v3: 升为主信号
 
     # =========================
     # 微动量参数
     # =========================
     mom_window_size: int = 12          # 优化: 从15调整到12
-    mom_long_threshold: float = 0.25   # 优化: 从0.20提高到0.25
-    mom_short_threshold: float = 0.25
+    # v3: 从主信号降为次级信号，阈值同步降低 0.25→0.10
+    # 原因: microprice在1-tick QUEUE市场几乎恒为0（价格不动=方向计数=0）
+    mom_long_threshold: float = 0.10   # v3: 0.25→0.10 (次级辅助阈值，旧值0.25为主信号阈值)
+    mom_short_threshold: float = 0.10  # v3: 0.25→0.10
     use_microprice_momentum: bool = True  # 新增: 使用microprice计算momentum
 
     # =========================
     # Microprice Tilt 参数
     # =========================
     use_microprice_tilt: bool = True
-    microprice_tilt_long: float = 0.25   # 优化: 从0.08提高到0.25
+    microprice_tilt_long: float = 0.25   # 优化: 从0.08提高到0.25 (v3: 仍为次级信号，值不变)
     microprice_tilt_short: float = 0.25
 
     # =========================
@@ -1102,9 +1128,23 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
     def _check_long_signal(self) -> bool:
         """
-        检查多头信号是否满足（3主+1辅门控）
-        主要指标: book_imbalance / lob_of_imbalance / micro_momentum（全部必须）
-        次级指标: tape_ofi / microprice_tilt（满足min_secondary_score个即可）
+        检查多头信号是否满足。
+
+        [v3 - 2026-03-17] 信号结构重构（QUEUE市场适配）
+        ─────────────────────────────────────────────────
+        旧逻辑 (v2): 主信号 = book AND of AND mom（3个全必须）
+                     次级信号 = tape OR mpt（满足>=1）
+          问题: TSE QUEUE 模式下(spread=1tick，占全天95%)，
+                book 与 of 相关系数≈0.17，book 强时 of 反而偏负(74%)，
+                mom 在价格不动时恒为0，导致三者同时满足概率≈0%。
+
+        新逻辑 (v3): 主信号 = book AND tape（被动盘口 + 主动成交双确认）
+                     次级信号 = of OR mom OR mpt（满足>=1，阈值降低）
+          理由: tape(实际成交)是QUEUE市场最可靠的主动意图信号；
+                of/mom/mpt降为辅助验证，避免三者相互拮抗永远不触发。
+
+        若 use_tape_ofi=False（tape被禁用），自动回退到 v2 逻辑（book+of+mom），
+        以兼容不支持 tape 的环境。
         """
         book_imb = self.book_imbalance
         of_imb = self.lob_of_imbalance
@@ -1112,28 +1152,50 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 主要指标（全部必须满足）
-        primary_ok = (
-            self.enable_long
-            and book_imb >= self.book_imbalance_long
-            and of_imb >= self.of_imbalance_long
-            and mom >= self.mom_long_threshold
-        )
-        if not primary_ok:
-            return False
+        if self.use_tape_ofi:
+            # v3 主要指标: book（被动盘口厚度）+ tape（主动成交方向）
+            # 大 bid 墙（book 强）+ 实际买单涌入（tape 强）= 可信多头
+            primary_ok = (
+                self.enable_long
+                and book_imb >= self.book_imbalance_long
+                and tape_imb >= self.tape_imbalance_long
+            )
+            if not primary_ok:
+                return False
 
-        # 次级指标（满足min_secondary_score个即可）
-        secondary_score = 0
-        if self.use_tape_ofi and tape_imb >= self.tape_imbalance_long:
-            secondary_score += 1
-        if self.use_microprice_tilt and mpt >= self.microprice_tilt_long:
-            secondary_score += 1
+            # v3 次级指标: of / mom / mpt（降阈值，满足 >= min_secondary_score 个）
+            # 三者任意一个正向偏离，说明除盘口外还有额外多头动力
+            secondary_score = 0
+            if of_imb >= self.of_imbalance_long:           # LOB-OFI: 最近挂单增量偏多
+                secondary_score += 1
+            if mom >= self.mom_long_threshold:             # 动量: microprice 上行
+                secondary_score += 1
+            if self.use_microprice_tilt and mpt >= self.microprice_tilt_long:  # mpt: 即时买压
+                secondary_score += 1
+        else:
+            # tape 被禁用时回退 v2 逻辑（book + of + mom 全必须）
+            primary_ok = (
+                self.enable_long
+                and book_imb >= self.book_imbalance_long
+                and of_imb >= self.of_imbalance_long
+                and mom >= self.mom_long_threshold
+            )
+            if not primary_ok:
+                return False
+            secondary_score = 0
+            if self.use_microprice_tilt and mpt >= self.microprice_tilt_long:
+                secondary_score += 1
 
         return secondary_score >= self.min_secondary_score
 
     # 🚀 v2优化: 信号强度检查
     def _is_strong_long_signal(self) -> bool:
-        """检查是否为强多头信号（所有指标远超阈值）"""
+        """
+        检查是否为强多头信号（主信号远超阈值 + 次级信号至少一个也超强）。
+
+        [v3] 与 _check_long_signal 保持一致的主/次信号分层结构：
+        强信号条件 = 主信号（book + tape）均超 multiplier 倍 AND 次级至少 1 个也超 multiplier 倍
+        """
         if not self.use_adaptive_confirm:
             return False
 
@@ -1144,23 +1206,36 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 所有指标都需要超过阈值*倍数
-        strong = (
-            book_imb >= self.book_imbalance_long * multiplier
-            and of_imb >= self.of_imbalance_long * multiplier
-            and mom >= self.mom_long_threshold * multiplier
-        )
-
         if self.use_tape_ofi:
-            strong = strong and (tape_imb >= self.tape_imbalance_long * multiplier)
-
-        if self.use_microprice_tilt:
-            strong = strong and (mpt >= self.microprice_tilt_long * multiplier)
-
-        return strong
+            # v3: 强信号以主信号（book + tape）为基础
+            primary_strong = (
+                book_imb >= self.book_imbalance_long * multiplier
+                and tape_imb >= self.tape_imbalance_long * multiplier
+            )
+            # 次级至少一个也超强，说明动力充足
+            secondary_strong = (
+                of_imb >= self.of_imbalance_long * multiplier
+                or mom >= self.mom_long_threshold * multiplier
+                or (self.use_microprice_tilt and mpt >= self.microprice_tilt_long * multiplier)
+            )
+            return primary_strong and secondary_strong
+        else:
+            # tape 禁用时回退 v2 逻辑（三主信号全部超强）
+            strong = (
+                book_imb >= self.book_imbalance_long * multiplier
+                and of_imb >= self.of_imbalance_long * multiplier
+                and mom >= self.mom_long_threshold * multiplier
+            )
+            if self.use_microprice_tilt:
+                strong = strong and (mpt >= self.microprice_tilt_long * multiplier)
+            return strong
 
     def _is_strong_short_signal(self) -> bool:
-        """检查是否为强空头信号（所有指标远超阈值）"""
+        """
+        检查是否为强空头信号。
+
+        [v3] 与 _is_strong_long_signal 对称，详见多头注释。
+        """
         if not self.use_adaptive_confirm:
             return False
 
@@ -1171,26 +1246,36 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 所有指标都需要超过阈值*倍数
-        strong = (
-            book_imb <= -self.book_imbalance_short * multiplier
-            and of_imb <= -self.of_imbalance_short * multiplier
-            and mom <= -self.mom_short_threshold * multiplier
-        )
-
         if self.use_tape_ofi:
-            strong = strong and (tape_imb <= -self.tape_imbalance_short * multiplier)
-
-        if self.use_microprice_tilt:
-            strong = strong and (mpt <= -self.microprice_tilt_short * multiplier)
-
-        return strong
+            # v3: 强空头信号
+            primary_strong = (
+                book_imb <= -self.book_imbalance_short * multiplier
+                and tape_imb <= -self.tape_imbalance_short * multiplier
+            )
+            secondary_strong = (
+                of_imb <= -self.of_imbalance_short * multiplier
+                or mom <= -self.mom_short_threshold * multiplier
+                or (self.use_microprice_tilt and mpt <= -self.microprice_tilt_short * multiplier)
+            )
+            return primary_strong and secondary_strong
+        else:
+            # tape 禁用时回退 v2 逻辑
+            strong = (
+                book_imb <= -self.book_imbalance_short * multiplier
+                and of_imb <= -self.of_imbalance_short * multiplier
+                and mom <= -self.mom_short_threshold * multiplier
+            )
+            if self.use_microprice_tilt:
+                strong = strong and (mpt <= -self.microprice_tilt_short * multiplier)
+            return strong
 
     def _check_short_signal(self) -> bool:
         """
-        检查空头信号是否满足（3主+1辅门控）
-        主要指标: book_imbalance / lob_of_imbalance / micro_momentum（全部必须）
-        次级指标: tape_ofi / microprice_tilt（满足min_secondary_score个即可）
+        检查空头信号是否满足。
+
+        [v3 - 2026-03-17] 与 _check_long_signal 对称，详见多头注释。
+        主信号 = book（ask 盘口厚）AND tape（主动卖单涌入）
+        次级信号 = of OR mom OR mpt（满足 >= min_secondary_score 个）
         """
         book_imb = self.book_imbalance
         of_imb = self.lob_of_imbalance
@@ -1198,22 +1283,37 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 主要指标（全部必须满足）
-        primary_ok = (
-            self.enable_short
-            and book_imb <= -self.book_imbalance_short
-            and of_imb <= -self.of_imbalance_short
-            and mom <= -self.mom_short_threshold
-        )
-        if not primary_ok:
-            return False
+        if self.use_tape_ofi:
+            # v3 主要指标（空头）: book（ask 侧厚）+ tape（主动卖单方向）
+            primary_ok = (
+                self.enable_short
+                and book_imb <= -self.book_imbalance_short
+                and tape_imb <= -self.tape_imbalance_short
+            )
+            if not primary_ok:
+                return False
 
-        # 次级指标（满足min_secondary_score个即可）
-        secondary_score = 0
-        if self.use_tape_ofi and tape_imb <= -self.tape_imbalance_short:
-            secondary_score += 1
-        if self.use_microprice_tilt and mpt <= -self.microprice_tilt_short:
-            secondary_score += 1
+            # v3 次级指标（空头）: of / mom / mpt（满足 >= min_secondary_score 个）
+            secondary_score = 0
+            if of_imb <= -self.of_imbalance_short:
+                secondary_score += 1
+            if mom <= -self.mom_short_threshold:
+                secondary_score += 1
+            if self.use_microprice_tilt and mpt <= -self.microprice_tilt_short:
+                secondary_score += 1
+        else:
+            # tape 被禁用时回退 v2 逻辑
+            primary_ok = (
+                self.enable_short
+                and book_imb <= -self.book_imbalance_short
+                and of_imb <= -self.of_imbalance_short
+                and mom <= -self.mom_short_threshold
+            )
+            if not primary_ok:
+                return False
+            secondary_score = 0
+            if self.use_microprice_tilt and mpt <= -self.microprice_tilt_short:
+                secondary_score += 1
 
         return secondary_score >= self.min_secondary_score
 

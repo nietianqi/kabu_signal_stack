@@ -155,7 +155,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     use_dynamic_position_polling: bool = True    # 启用动态建玉轮询（替代固定2s延迟）
     position_poll_interval_ms: int = 50          # 建玉轮询间隔(ms)
     max_position_wait_seconds: float = 2.0       # 最大等待时间(s)，超时强制挂单
-    limit_tp_delay_seconds: float = 1.5          # 固定延迟模式下的止盈单提交延迟(s)，最小0.5s
+    limit_tp_delay_seconds: float = 0.5          # v3 fix: 1.5→0.5，减少成交到TP挂单之间的无保护窗口（实测2.1-2.7s过长）
 
     # =========================
     # 盘口过滤
@@ -236,7 +236,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # =========================
     # 订单管理（🚀 性能优化）
     # =========================
-    entry_order_timeout: float = 3.0   # 优化: 从1.2提高到3.0
+    entry_order_timeout: float = 10.0  # v3 fix: 3.0→10.0，小盘稀疏股挂单等待时间不足导致超时重发循环
     exit_order_timeout: float = 1.0    # 优化: 从0.8提高到1.0
 
     # 🚀 v2优化: 分离开平仓限流，平衡速度与API保护

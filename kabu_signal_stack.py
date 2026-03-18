@@ -475,7 +475,7 @@ class SignalConfig:
     flow_flip_threshold: int = 3          # consecutive direction reversals to declare a flip
 
     # Adapter
-    reverse_bid_ask: bool = False         # Set True if gateway passes raw kabu field names
+    reverse_bid_ask: bool = True          # v8: default True — kabu gateway passes raw field names (BidPrice=ask, AskPrice=bid)
     max_spread_pct:  float = 0.05         # reject ticks where spread > 5% of bid (霑夲ｽｹ陋ｻ・･雎碁斡繝ｻ filter)
     auto_fix_negative_spread: bool = True
     auto_fix_negative_spread_max_ticks: float = 3.0
@@ -1268,7 +1268,7 @@ def make_strategy_preset_balanced() -> Dict[str, object]:
         "max_position": 600,
         "enable_long": True,
         "enable_short": False,
-        "reverse_bid_ask": False,
+        "reverse_bid_ask": True,         # v8 default: kabu gateway passes raw field names
         "auto_pricetick": False,
         "max_spread_ticks": 2.0,
         "min_best_volume": 50,
@@ -1392,7 +1392,7 @@ if _VNPY_AVAILABLE:
         ev_gate_enabled: bool = False
 
         # Adapter
-        reverse_bid_ask: bool = False   # Set True if kabu gateway passes raw field names
+        reverse_bid_ask: bool = True    # v8 default: kabu gateway passes raw field names (BidPrice=ask, AskPrice=bid)
         auto_fix_negative_spread: bool = True
         auto_fix_negative_spread_max_ticks: float = 3.0
         # ⚠️ 开启 TSE 表自动推断：kabu gateway 对部分股票 contract.pricetick=1.0 不可信。
@@ -1723,10 +1723,11 @@ if _VNPY_AVAILABLE:
             if has_contract_pt:
                 self.price_tick = float(pt)
 
-            if self.reverse_bid_ask:
+            if not self.reverse_bid_ask:
                 self.write_log(
-                    "[WARN] reverse_bid_ask=True. With vnpy_kabu gateway this is often wrong. "
-                    "If you see 'Bad tick skipped (bid>=ask)', set reverse_bid_ask=False."
+                    "[WARN] reverse_bid_ask=False. Default is now True (v8). "
+                    "If you see 'Bad tick skipped (bid>=ask)', set reverse_bid_ask=True "
+                    "(kabu gateway passes raw field names: BidPrice=ask, AskPrice=bid)."
                 )
 
             # Step 3: rebuild signal engine from strategy parameters.

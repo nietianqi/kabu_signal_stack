@@ -154,7 +154,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # 🚀 v2优化: 动态建玉轮询，降低止盈延迟
     use_dynamic_position_polling: bool = True    # 启用动态建玉轮询（替代固定2s延迟）
     position_poll_interval_ms: int = 50          # 建玉轮询间隔(ms)
-    max_position_wait_seconds: float = 2.0       # 最大等待时间(s)，超时强制挂单
+    max_position_wait_seconds: float = 1.0       # v3 fix: 2.0→1.0，kabu持仓同步通常<0.5s，2s过于保守导致TP总延迟=0.5+2.0=2.5s
     limit_tp_delay_seconds: float = 0.5          # v3 fix: 1.5→0.5，减少成交到TP挂单之间的无保护窗口（实测2.1-2.7s过长）
 
     # =========================
@@ -812,15 +812,22 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 self._limit_tp_order_ids.clear()
 
                 # 2. 计算止盈价（使用加权平均成交价 + 1tick）
-                # ⚠️ 用 TSE 表二次确认价位：避免 contract.pricetick=1.0 伪装导致非法价位（如 3256 而非 3260）
+                # v3 fix: _price_tick_verified=True 时直接信任已验证的 price_tick，
+                # 避免 TSE 表推断值（如 1.0）错误覆盖已纠偏的小数 tick（如 0.1）。
+                # 只有未经验证时才用 TSE 表兜底。
                 pt_contract = self.price_tick if self.price_tick > 0 else 1.0
-                pt_tse = self._get_tse_pricetick(self.entry_price)
-                pt = max(pt_contract, pt_tse)  # 取较大值（更保守，确保合法）
-                if pt != pt_contract:
-                    self.write_log(
-                        f"⚠️ [TP价位] 合约pricetick={pt_contract} 但TSE表推断={pt_tse}，"
-                        f"将使用 {pt}¥ 计算TP（原合约值可能不可信）"
-                    )
+                if self._price_tick_verified:
+                    # ✅ 已由合约或 _periodic_verify_price_tick 确认，直接使用
+                    pt = pt_contract
+                else:
+                    # 未验证：用 TSE 表推断做保底（取较大值，避免非法价位如 3256 而非 3260）
+                    pt_tse = self._get_tse_pricetick(self.entry_price)
+                    pt = max(pt_contract, pt_tse)
+                    if pt != pt_contract:
+                        self.write_log(
+                            f"⚠️ [TP价位] price_tick未验证，合约={pt_contract} TSE推断={pt_tse}，"
+                            f"将使用 {pt}¥ 计算TP（建议让 price_tick 自动验证后再开仓）"
+                        )
 
                 if self.entry_direction == Direction.LONG:
                     # 多头：成本价 + 1tick（确保对齐到 TSE 合法价位）

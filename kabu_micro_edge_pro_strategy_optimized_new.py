@@ -2320,14 +2320,17 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
         # 提交订单（先做价位合法性校验，防止非法价格反复被拒单）
         try:
-            # ⚠️ 每次提交前用 TSE 表重验价位：
-            # 若 _pending_tp_price 不是合法价位（如 3256 而非 3260），自动纠正
-            _pt_ref = self._get_tse_pricetick(self._pending_tp_price)
+            # v3 fix: 与 on_trade 一致——_price_tick_verified=True 时直接信任已验证值，
+            # 避免 TSE 表推断（如 1.0）错误覆盖已纠偏的小数 tick（如 0.1 → 653.80 变 654.00）。
+            if self._price_tick_verified and self.price_tick > 0:
+                _pt_ref = self.price_tick
+            else:
+                _pt_ref = self._get_tse_pricetick(self._pending_tp_price)
             _snapped = round(self._pending_tp_price / _pt_ref) * _pt_ref
             if abs(_snapped - self._pending_tp_price) > 0.01:
                 self.write_log(
                     f"🔧 [TP价位校正] {self._pending_tp_price:.0f} → {_snapped:.0f}"
-                    f" (TSE pricetick={_pt_ref}¥，原价非法)"
+                    f" (pricetick={_pt_ref}¥，原价非法)"
                 )
                 self._pending_tp_price = _snapped
 

@@ -1409,7 +1409,7 @@ if _VNPY_AVAILABLE:
         profit_ticks: float = 3.0
         loss_ticks: float = 999.0            # v7: effectively disabled; use max_loss_per_trade_jpy
         max_hold_seconds: float = 30.0
-        open_order_timeout_sec: float = 3.0
+        open_order_timeout_sec: float = 10.0   # v8.3 fix: 3.0→10.0 小盘股挂单等待不足导致循环撤单重发
         close_order_timeout_sec: float = 5.0  # v7: wider timeout for non-TP close orders
         taker_exit_extra_ticks: float = 0.0
         trailing_activate_ticks: float = 2.0
@@ -2793,13 +2793,14 @@ if _VNPY_AVAILABLE:
                     self._state_since = now
                 return
 
-            # --- TP order exemption: when hold_if_loss=True, the TP limit order must
-            # keep resting until filled or until tp_order_timeout_sec expires.
-            # This prevents the 2-5s close_order_timeout from cancelling valid TP orders. ---
+            # --- TP order exemption: TP limit orders must always rest until filled or
+            # tp_order_timeout_sec expires — regardless of hold_if_loss.
+            # v8.3 fix: removed "and self.hold_if_loss" guard; close_order_timeout_sec
+            # was cancelling TP every 5s, causing signal_exit to fire at bid/ask and
+            # potentially lock in a loss (e.g. cc2413 TP 1647→1644 chase). ---
             if (
                 self._order_state == OrderState.PENDING_CLOSE
                 and self._pending_exit_reason == "TP"
-                and self.hold_if_loss
             ):
                 tp_timeout = getattr(self, "tp_order_timeout_sec", 300.0)
                 if tp_timeout <= 0 or elapsed < tp_timeout:

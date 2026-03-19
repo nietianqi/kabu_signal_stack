@@ -1493,10 +1493,11 @@ if _VNPY_AVAILABLE:
         # Smart cancel for pending open orders
         smart_cancel_on_flip: bool = True        # When True: cancel PENDING_OPEN order immediately
                                                  # if the entry signal reverses (no waiting for timeout)
+        smart_cancel_min_pending_sec: float = 0.8  # minimum resting time before smart cancel can fire
 
         # --- v5 parameters ---
         # Per-trade JPY emergency stop (from reference strategy)
-        max_loss_per_trade_jpy: float = 100_000.0  # v7: 10万円 hard floor; works with hold_if_loss=True
+        max_loss_per_trade_jpy: float = 100_000.0  # ignored when hold_if_loss=True
 
         # Verbose logging control (from reference strategy)
         verbose_log: bool = False                 # True: output detailed debug logs (rate-limit reasons, etc.)
@@ -1556,7 +1557,7 @@ if _VNPY_AVAILABLE:
             "auto_tp_on_fill", "auto_tp_ticks",
             "auto_tp_retry_max", "auto_tp_retry_delay_sec",
             "auto_tp_fast_retries", "auto_tp_slow_retry_sec",
-            "smart_cancel_on_flip",
+            "smart_cancel_on_flip", "smart_cancel_min_pending_sec",
             "max_tick_stale_seconds", "stale_feed_force_flatten",
             # v5
             "max_loss_per_trade_jpy",
@@ -1683,6 +1684,7 @@ if _VNPY_AVAILABLE:
             self._last_recv_time: Optional[datetime] = None
             self._tick_stale_state: bool = False
             self._stale_force_flatten_pending: bool = False
+            self._close_reconcile_pending: bool = False
             self._market_state: MarketState = MarketState.NORMAL
             self._market_state_reason: str = "init"
             self._market_event_ts_ns: Deque[int] = deque(maxlen=4096)
@@ -1719,9 +1721,12 @@ if _VNPY_AVAILABLE:
 
             # Step 2: load pricetick from contract if available.
             pt = self.get_pricetick()
-            has_contract_pt = bool(pt and pt > 0)
-            if has_contract_pt:
+            trusted_contract_pt = self._is_contract_pricetick_trustworthy(pt)
+            if pt and pt > 0:
                 self.price_tick = float(pt)
+            if not self.hold_if_loss:
+                self.hold_if_loss = True
+                self.write_log("[RISK] hold_if_loss forced to True: 亏损仓不做自动平仓")
 
             if not self.reverse_bid_ask:
                 self.write_log(
@@ -1739,16 +1744,19 @@ if _VNPY_AVAILABLE:
                 reverse_bid_ask=self.reverse_bid_ask,
                 auto_fix_negative_spread=self.auto_fix_negative_spread,
                 auto_fix_negative_spread_max_ticks=self.auto_fix_negative_spread_max_ticks,
-                # If contract pricetick exists, disable heuristic auto inference.
-                # Contract metadata is authoritative and avoids accidental 0.1/1.0 mismatch.
-                auto_pricetick=(self.auto_pricetick and not has_contract_pt),
+                # Keep auto_pricetick on until contract tick is proven trustworthy.
+                auto_pricetick=(self.auto_pricetick and not trusted_contract_pt),
                 znorm_lookback=self.znorm_lookback,
                 flow_flip_threshold=self.flow_flip_threshold,
             )
             self.sig = KabuSignalStack(cfg, self.price_tick)
-            if self.auto_pricetick and has_contract_pt:
+            if self.auto_pricetick and trusted_contract_pt:
                 self.write_log(
                     f"[pricetick] 合约价位可用({self.price_tick})，关闭auto_pricetick推断以避免覆盖"
+                )
+            elif self.auto_pricetick and pt and pt > 0:
+                self.write_log(
+                    f"[pricetick] 合约价位={float(pt):.1f} 暂未确认可信，保留auto_pricetick实时校正"
                 )
             self._reset_position_state()
             self._market_state = MarketState.NORMAL
@@ -1765,6 +1773,42 @@ if _VNPY_AVAILABLE:
         # ------------------------------------------------------------------
         # v5: Periodic pricetick verification & verbose logging helpers
         # ------------------------------------------------------------------
+
+        def _is_contract_pricetick_trustworthy(
+            self,
+            pricetick: float,
+            ref_price: float = 0.0,
+        ) -> bool:
+            """Treat contract pricetick=1.0 as untrusted until live price confirms it."""
+            try:
+                pt = float(pricetick)
+            except Exception:
+                return False
+            if pt <= 0:
+                return False
+            if abs(pt - 1.0) > 1e-9:
+                return True
+            if ref_price <= 0:
+                return False
+            return abs(get_tse_pricetick(ref_price) - pt) <= 1e-9
+
+        def _sync_runtime_pricetick(self, new_pt: float, reason: str) -> None:
+            try:
+                pt = float(new_pt)
+            except Exception:
+                return
+            if pt <= 0 or abs(pt - self.price_tick) <= 1e-9:
+                return
+            self.write_log(f"[pricetick] {reason}: {self.price_tick} -> {pt}")
+            self.price_tick = pt
+            self.sig.update_pricetick(pt)
+
+        def _is_losing_position(self, snap: TickSnapshot) -> bool:
+            if self._entry_fill_price <= 0 or self.pos == 0:
+                return False
+            if self.pos > 0:
+                return snap.bid1 < self._entry_fill_price - 1e-9
+            return snap.ask1 > self._entry_fill_price + 1e-9
 
         def _periodic_verify_price_tick(self, now: datetime) -> None:
             """Re-read pricetick from contract every 30 s.
@@ -1787,15 +1831,18 @@ if _VNPY_AVAILABLE:
                 contract = me.get_contract(self.vt_symbol)
                 if contract and hasattr(contract, "pricetick") and contract.pricetick > 0:
                     new_pt = float(contract.pricetick)
-                    if abs(new_pt - self.price_tick) > 1e-9:
-                        self.write_log(
-                            f"[pricetick] 自动修正: {self.price_tick} → {new_pt} (合约延迟加载)"
-                        )
-                        self.price_tick = new_pt
-                        self.sig.update_pricetick(new_pt)   # propagate to signal engine
-                    # Contract pricetick is authoritative once available.
-                    self.sig.cfg.auto_pricetick = False
-                    self._price_tick_verified = True
+                    ref_price = 0.0
+                    if self._last_snap is not None:
+                        ref_price = self._last_snap.last_price or self._last_snap.mid
+                    if self._is_contract_pricetick_trustworthy(new_pt, ref_price):
+                        self._sync_runtime_pricetick(new_pt, "合约延迟加载")
+                        self.sig.cfg.auto_pricetick = False
+                        self._price_tick_verified = True
+                    elif self.auto_pricetick and ref_price > 0:
+                        inferred_pt = get_tse_pricetick(ref_price)
+                        self._sync_runtime_pricetick(inferred_pt, "TSE表校正")
+                        self.sig.cfg.auto_pricetick = True
+                        self._price_tick_verified = False
             except Exception:
                 pass  # silent fail; will retry in 30 s
 
@@ -1859,6 +1906,7 @@ if _VNPY_AVAILABLE:
             if snap is None:
                 self._maybe_log_bad_tick(tick)
                 return
+            self._sync_runtime_pricetick(snap.pricetick, "行情实时同步")
             self._last_snap = snap
 
             tick_dt = snap.dt
@@ -2136,6 +2184,7 @@ if _VNPY_AVAILABLE:
 
             if not self._active_orderids:
                 self._cancel_waiting_ack = False
+                self._close_reconcile_pending = False
                 if self._order_state == OrderState.PENDING_OPEN:
                     if cancelled and self._entry_fill_volume <= 0:
                         # Safe MAKER escape: retry only after cancel acknowledgement.
@@ -2438,11 +2487,11 @@ if _VNPY_AVAILABLE:
             elapsed = (tick_dt - self._entry_time).total_seconds()
 
             # ----------------------------------------------------------------
-            # C0: JPY per-trade emergency stop (highest priority, overrides hold_if_loss)
-            # Prevents unlimited loss when hold_if_loss=True or loss_ticks is wide.
-            # Inspired by max_loss_per_trade in kabu_micro_edge_pro strategy.
+            # C0: JPY per-trade emergency stop.
+            # Disabled in hold_if_loss mode: user explicitly wants losing positions
+            # to never auto-close.
             # ----------------------------------------------------------------
-            if self.max_loss_per_trade_jpy > 0 and self._entry_fill_price > 0:
+            if (not self.hold_if_loss) and self.max_loss_per_trade_jpy > 0 and self._entry_fill_price > 0:
                 direction_sign = +1 if self._entry_direction == "LONG" else -1
                 ref_price = snap.bid1 if self._entry_direction == "LONG" else snap.ask1
                 unrealized_jpy = (
@@ -2603,6 +2652,9 @@ if _VNPY_AVAILABLE:
             """Immediate close path used by hard risk halt."""
             if self._active_orderids:
                 return
+            if self.hold_if_loss and self._is_losing_position(snap):
+                self.write_log(f"[HOLD LOSS] skip auto close reason={reason}")
+                return
             self._clear_pending_auto_tp()
             pt = max(self.price_tick, 1e-9)
             extra = max(0.0, float(self.taker_exit_extra_ticks)) * pt
@@ -2688,6 +2740,59 @@ if _VNPY_AVAILABLE:
                 self._market_state_reason = "new_day"
                 self.write_log(f"New trading day: {date_str}")
 
+        def _reconcile_active_orders(self, now: datetime) -> None:
+            """Drop stale active order ids when gateway no longer knows them."""
+            if not self._active_orderids:
+                return
+            if self._state_since is not None:
+                age = (now - self._state_since).total_seconds()
+                if age < 1.0 and not self._cancel_waiting_ack:
+                    return
+            me = getattr(getattr(self, "cta_engine", None), "main_engine", None)
+            if me is None or not hasattr(me, "get_order"):
+                return
+
+            live_ids: List[str] = []
+            stale_ids: List[str] = []
+            for vt_orderid in list(self._active_orderids):
+                order = me.get_order(vt_orderid)
+                if order is None:
+                    stale_ids.append(vt_orderid)
+                    continue
+                status = getattr(order, "status", None)
+                try:
+                    is_active = status in (Status.SUBMITTING, Status.NOTTRADED, Status.PARTTRADED)
+                except Exception:
+                    s = str(status).lower()
+                    is_active = any(x in s for x in ("submit", "nottraded", "parttraded", "partial", "pending"))
+                if is_active:
+                    live_ids.append(vt_orderid)
+                else:
+                    stale_ids.append(vt_orderid)
+
+            if not stale_ids:
+                return
+
+            self._active_orderids = live_ids
+            if live_ids:
+                return
+
+            self._cancel_waiting_ack = False
+            if self.pos == 0:
+                self._reset_position_state()
+                return
+
+            if self._order_state == OrderState.PENDING_CLOSE:
+                stale_joined = ",".join(stale_ids)
+                self.write_log(
+                    f"[RECOVER] stale close order(s) cleared -> reopen exit management: {stale_joined}"
+                )
+                self._order_state = OrderState.OPEN
+                self._state_since = now
+                self.order_state = OrderState.OPEN.value
+                if self._pending_exit_reason == "TP":
+                    self._try_place_auto_tp(now)
+
         def _check_pending_timeouts(self, now: datetime, snap: TickSnapshot) -> None:
             """Cancel stale pending orders and recover state safely.
 
@@ -2700,6 +2805,7 @@ if _VNPY_AVAILABLE:
             if self._state_since is None:
                 return
 
+            self._reconcile_active_orders(now)
             elapsed = (now - self._state_since).total_seconds()
 
             # Recovery guard: sometimes order callbacks leave PENDING_OPEN with
@@ -2729,6 +2835,23 @@ if _VNPY_AVAILABLE:
                     return
                 # Ack may be delayed/lost in some gateway paths; allow retry.
                 self._cancel_waiting_ack = False
+                if self._close_reconcile_pending:
+                    stale_ids = list(self._active_orderids)
+                    if stale_ids:
+                        self.write_log(
+                            "[RECOVER] close cancel ack missing -> clear stale orderids "
+                            f"({','.join(stale_ids[:3])})"
+                        )
+                        self._active_orderids = []
+                    if self.pos == 0:
+                        self._reset_position_state()
+                    else:
+                        self._order_state = OrderState.OPEN
+                        self._state_since = now
+                        self.order_state = OrderState.OPEN.value
+                        if self._pending_exit_reason == "TP":
+                            self._try_place_auto_tp(now)
+                    self._close_reconcile_pending = False
 
             # --- Smart cancel: if PENDING_OPEN and signal has flipped, cancel immediately ---
             # Avoids sitting in a stale limit order waiting for timeout when the signal is gone.
@@ -2737,33 +2860,55 @@ if _VNPY_AVAILABLE:
                 and self._order_state == OrderState.PENDING_OPEN
                 and not self._maker_escape_pending
             ):
-                signal_gone = (
-                    (self._entry_direction == "LONG" and not self.sig.can_open_long())
-                    or (self._entry_direction == "SHORT" and not self.sig.can_open_short())
-                )
-                alpha_flip = (
-                    self._pending_entry_alpha != 0.0
-                    and (self.sig.edge_score * self._pending_entry_alpha) < 0
-                    and abs(self.sig.edge_score) >= max(0.5, self.strong_signal_threshold * 0.5)
-                )
-                fair_drift = False
-                fair_drift_ticks = 0.0
-                if self._pending_entry_fair_price > 0:
-                    fair_now, _ = self._fair_and_reservation(snap)
-                    fair_drift_ticks = abs(fair_now - self._pending_entry_fair_price) / max(self.price_tick, 1e-9)
-                    fair_drift = fair_drift_ticks >= self.max_fair_drift_ticks
-                if signal_gone or alpha_flip or fair_drift:
-                    reason = "signal_flip" if signal_gone else ("alpha_flip" if alpha_flip else "fair_drift")
-                    self.write_log(
-                        f"[SMART CANCEL] {reason} during PENDING_OPEN ({self._entry_direction})"
-                        + (f" drift={fair_drift_ticks:.2f}t" if fair_drift else "")
+                smart_cancel_grace = max(0.0, float(self.smart_cancel_min_pending_sec))
+                if self._market_state == MarketState.QUEUE:
+                    smart_cancel_grace = max(smart_cancel_grace, 1.2)
+                if self.sig.regime == "NOISE":
+                    smart_cancel_grace = max(smart_cancel_grace, 1.0)
+                if elapsed >= smart_cancel_grace:
+                    queue_or_noise = (
+                        self._market_state == MarketState.QUEUE
+                        or self.sig.regime == "NOISE"
                     )
-                    sent = self._rl_cancel_all(now)
-                    if sent:
-                        # Do NOT set _maker_escape_pending: signal is gone, just abort on ack.
-                        self._cancel_waiting_ack = True
-                        self._state_since = now
-                    return
+                    signal_gone = (
+                        (self._entry_direction == "LONG" and not self.sig.can_open_long())
+                        or (self._entry_direction == "SHORT" and not self.sig.can_open_short())
+                    )
+                    alpha_flip_min = max(0.5, self.strong_signal_threshold * 0.5)
+                    if self._market_state == MarketState.QUEUE:
+                        alpha_flip_min = max(alpha_flip_min, self.strong_signal_threshold * 0.8)
+                    if self.sig.regime == "NOISE":
+                        alpha_flip_min = max(alpha_flip_min, self.strong_signal_threshold)
+                    alpha_flip = (
+                        self._pending_entry_alpha != 0.0
+                        and (self.sig.edge_score * self._pending_entry_alpha) < 0
+                        and abs(self.sig.edge_score) >= alpha_flip_min
+                    )
+                    fair_drift = False
+                    fair_drift_ticks = 0.0
+                    if self._pending_entry_fair_price > 0:
+                        fair_now, _ = self._fair_and_reservation(snap)
+                        fair_drift_ticks = abs(fair_now - self._pending_entry_fair_price) / max(self.price_tick, 1e-9)
+                        fair_drift_limit = self.max_fair_drift_ticks
+                        if self._market_state == MarketState.QUEUE:
+                            fair_drift_limit += 1.0
+                        if self.sig.regime == "NOISE":
+                            fair_drift_limit += 0.5
+                        fair_drift = fair_drift_ticks >= fair_drift_limit
+                    if queue_or_noise and signal_gone and not (alpha_flip or fair_drift):
+                        signal_gone = False
+                    if signal_gone or alpha_flip or fair_drift:
+                        reason = "signal_flip" if signal_gone else ("alpha_flip" if alpha_flip else "fair_drift")
+                        self.write_log(
+                            f"[SMART CANCEL] {reason} during PENDING_OPEN ({self._entry_direction})"
+                            + (f" drift={fair_drift_ticks:.2f}t" if fair_drift else "")
+                        )
+                        sent = self._rl_cancel_all(now)
+                        if sent:
+                            # Do NOT set _maker_escape_pending: signal is gone, just abort on ack.
+                            self._cancel_waiting_ack = True
+                            self._state_since = now
+                        return
 
             # --- MAKER escape: runs before the full open timeout ---
             if (
@@ -2814,9 +2959,7 @@ if _VNPY_AVAILABLE:
                 sent = self._rl_cancel_all(now)
                 if sent:
                     self._cancel_waiting_ack = True
-                    # Move back to OPEN and wait for cancel update before new close.
-                    self._order_state = OrderState.OPEN
-                    self.order_state = OrderState.OPEN.value
+                    self._close_reconcile_pending = True
                     self._state_since = now
                 return
 
@@ -3310,6 +3453,7 @@ if _VNPY_AVAILABLE:
             self._last_close_order_ts = None
             self._maker_escape_pending = False
             self._cancel_waiting_ack = False
+            self._close_reconcile_pending = False
             self._pending_open_orphan_since = None
             self._signal_pending_dt = None
             self._pending_entry_fair_price = 0.0

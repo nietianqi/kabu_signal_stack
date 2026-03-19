@@ -18,12 +18,33 @@
 # 12. 信号强度自适应确认: 强信号1次确认,弱信号2次
 # 13. 增量指标计算: LOB-OFI/Tape-OFI使用增量更新
 #
+# 🔬 信号结构重构 (v3) — 2026-03-17:
+# 14. 主信号从「book AND of AND mom」改为「book AND tape」
+#
+#   【根因】对 TSE QUEUE 模式股票（spread=1 tick，约占全天95%）的日志分析：
+#     - book（OBI，快照）与 of（LOB-OFI，增量）相关系数仅 0.17（近乎无关）
+#     - 当 book >= 0.35（大 bid 墙）时，of < 0 的概率高达 74%（大 bid 静止→OFI偏负）
+#     - mom（microprice方向）在 1-tick spread 市场几乎恒为 0（价格不动=方向=0）
+#     - 3个AND门全天通过率≈0%，实际入场仅靠开盘噪声触发
+#
+#   【新逻辑】主信号 = book（被动盘口厚度）AND tape（主动成交方向）
+#            次级信号 = of / mom / mpt 任满足 ≥ 1 个（阈值降低）
+#
+#   【理由】tape（实际成交）是 QUEUE 市场唯一可靠的主动买卖意图信号；
+#           of/mom/mpt 降为辅助验证，避免三者相互拮抗导致信号永远不触发。
+#
+#   【参数变化】
+#     of_imbalance_long/short:  0.25 → 0.10  (降为辅助阈值)
+#     mom_long/short_threshold: 0.25 → 0.10  (降为辅助阈值)
+#     tape_imbalance_long/short: 0.20 不变    (升为主信号，值已合适)
+#     book_imbalance_long/short: 0.35 不变    (仍为主信号)
+#
 # 主要信号:
-# 1) 加权盘口不平衡（多档深度）
-# 2) LOB-OFI（订单簿订单流不平衡）
-# 3) Tape-OFI（逐笔成交主动性）
-# 4) 微动量（microprice 方向滚动）
-# 5) Microprice tilt（microprice 相对 mid 的偏移）
+# 1) 加权盘口不平衡（多档深度）     ← v3 主信号 1
+# 2) Tape-OFI（逐笔成交主动性）     ← v3 主信号 2（从次级升为主级）
+# 3) LOB-OFI（订单簿订单流不平衡）  ← v3 次级信号（从主级降为次级）
+# 4) 微动量（microprice 方向滚动）  ← v3 次级信号（从主级降为次级）
+# 5) Microprice tilt（microprice 相对 mid 的偏移）  ← v3 次级信号（不变）
 
 from __future__ import annotations
 
@@ -90,6 +111,10 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # price_tick 周期性验证
     PRICE_TICK_VERIFY_INTERVAL = 30.0         # 验证间隔（秒）
 
+    # 启动后持仓恢复
+    ENTRY_SYNC_RETRY_INTERVAL = 1.0           # entry 恢复失败后的重试间隔（秒）
+    ENTRY_SYNC_CLEAR_MISSES = 3               # 连续确认 broker 无仓后清理本地残留状态
+
     # 连亏计数
     CONTINUOUS_LOSS_COUNT_THRESHOLD = 5       # 连亏次数阈值（用于日志显示）
 
@@ -123,6 +148,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     limit_tp_ticks: int = 1                 # 限价止盈单距离入场价的tick数
     limit_tp_timeout: float = 0.0           # 限价止盈单超时时间(秒)，0=永不超时
     tp_only_mode: bool = True               # 只用限价止盈平仓，亏损不自动平仓（禁用止损/FlowFlip）
+    allow_unbounded_loss_in_tp_only: bool = False  # 只有显式允许时，tp_only_mode 才会关闭兜底亏损保护
 
     # 🔴 兜底止损参数（修复tp_only_mode盲区）
     max_loss_per_trade: float = -500.0      # 单笔最大亏损(日元)，即使tp_only_mode=True也会触发
@@ -133,8 +159,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # 🚀 v2优化: 动态建玉轮询，降低止盈延迟
     use_dynamic_position_polling: bool = True    # 启用动态建玉轮询（替代固定2s延迟）
     position_poll_interval_ms: int = 50          # 建玉轮询间隔(ms)
-    max_position_wait_seconds: float = 2.0       # 最大等待时间(s)，超时强制挂单
-    limit_tp_delay_seconds: float = 1.5          # 固定延迟模式下的止盈单提交延迟(s)，最小0.5s
+    max_position_wait_seconds: float = 1.0       # v3 fix: 2.0→1.0，kabu持仓同步通常<0.5s，2s过于保守导致TP总延迟=0.5+2.0=2.5s
+    limit_tp_delay_seconds: float = 0.5          # v3 fix: 1.5→0.5，减少成交到TP挂单之间的无保护窗口（实测2.1-2.7s过长）
 
     # =========================
     # 盘口过滤
@@ -159,30 +185,35 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # LOB-OFI 参数
     # =========================
     of_window_size: int = 18           # 优化: 从20调整到18
-    of_imbalance_long: float = 0.25    # 优化: 从0.22提高到0.25
-    of_imbalance_short: float = 0.25
+    # v3: 从主信号降为次级信号，阈值同步降低 0.25→0.10
+    # 原因: QUEUE市场中 of 与 book 相关性仅0.17，book强时of反而偏负(74%概率)
+    of_imbalance_long: float = 0.10    # v3: 0.25→0.10 (次级辅助阈值，旧值0.25为主信号阈值)
+    of_imbalance_short: float = 0.10   # v3: 0.25→0.10
 
     # =========================
     # Tape-OFI 参数
     # =========================
     use_tape_ofi: bool = True
     tape_window_seconds: float = 1.0   # 优化: 从0.5扩展到1.0，与LOB-OFI时间窗口对齐
-    tape_imbalance_long: float = 0.20  # 优化: 从0.18提高到0.20
-    tape_imbalance_short: float = 0.20
+    # v3: tape 升为主信号，阈值不变（0.20已适合做主信号门槛）
+    tape_imbalance_long: float = 0.20  # v3: 升为主信号（值不变，语义变化: 次级→主级）
+    tape_imbalance_short: float = 0.20 # v3: 升为主信号
 
     # =========================
     # 微动量参数
     # =========================
     mom_window_size: int = 12          # 优化: 从15调整到12
-    mom_long_threshold: float = 0.25   # 优化: 从0.20提高到0.25
-    mom_short_threshold: float = 0.25
+    # v3: 从主信号降为次级信号，阈值同步降低 0.25→0.10
+    # 原因: microprice在1-tick QUEUE市场几乎恒为0（价格不动=方向计数=0）
+    mom_long_threshold: float = 0.10   # v3: 0.25→0.10 (次级辅助阈值，旧值0.25为主信号阈值)
+    mom_short_threshold: float = 0.10  # v3: 0.25→0.10
     use_microprice_momentum: bool = True  # 新增: 使用microprice计算momentum
 
     # =========================
     # Microprice Tilt 参数
     # =========================
     use_microprice_tilt: bool = True
-    microprice_tilt_long: float = 0.25   # 优化: 从0.08提高到0.25
+    microprice_tilt_long: float = 0.25   # 优化: 从0.08提高到0.25 (v3: 仍为次级信号，值不变)
     microprice_tilt_short: float = 0.25
 
     # =========================
@@ -210,7 +241,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # =========================
     # 订单管理（🚀 性能优化）
     # =========================
-    entry_order_timeout: float = 3.0   # 优化: 从1.2提高到3.0
+    entry_order_timeout: float = 10.0  # v3 fix: 3.0→10.0，小盘稀疏股挂单等待时间不足导致超时重发循环
     exit_order_timeout: float = 1.0    # 优化: 从0.8提高到1.0
 
     # 🚀 v2优化: 分离开平仓限流，平衡速度与API保护
@@ -268,7 +299,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         "entry_slip_ticks", "exit_slip_ticks",
         "take_profit_mode", "tp_trigger_use_last_price",
         "trailing_trigger_ticks", "trailing_stop_ticks", "trailing_min_lock_ticks",
-        "enable_limit_tp_order", "limit_tp_ticks", "limit_tp_timeout", "tp_only_mode", "max_loss_per_trade",
+        "enable_limit_tp_order", "limit_tp_ticks", "limit_tp_timeout", "tp_only_mode", "allow_unbounded_loss_in_tp_only", "max_loss_per_trade",
         "max_price_deviation_ticks",
         "use_dynamic_position_polling", "position_poll_interval_ms", "max_position_wait_seconds", "limit_tp_delay_seconds",
         "min_spread_ticks", "max_spread_ticks", "min_best_volume",
@@ -372,6 +403,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         # 持仓恢复状态（避免每tick重复打印WARNING）
         self._entry_sync_failed: bool = False   # 是否已警告过"entry信息无法从持仓恢复"
         self._entry_sync_warned: bool = False   # 是否已打印过EXIT-SKIP警告
+        self._last_entry_sync_attempt_dt: Optional[datetime] = None
+        self._entry_sync_missing_position_count: int = 0
 
         # LOB 内存
         self._prev_bid_prices: List[float] = []
@@ -449,10 +482,160 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         a2, b2 = self._align_datetimes(a, b)
         return (a2 - b2).total_seconds()
 
+    def _apply_runtime_safety_overrides(self) -> None:
+        """Guard against tp_only configurations that disable every loss exit."""
+        if (
+            self.tp_only_mode
+            and not self.enable_max_loss_per_trade_exit
+            and not self.allow_unbounded_loss_in_tp_only
+        ):
+            self.enable_max_loss_per_trade_exit = True
+            self.write_log(
+                "⚠️ [RISK-OVERRIDE] tp_only_mode 已自动保留兜底亏损保护；"
+                "如确实要允许无限亏损，请显式设置 allow_unbounded_loss_in_tp_only=True"
+            )
+
+    def _clear_stale_local_position(self, reason: str) -> None:
+        """Clear stale local position state when broker-side position is absent."""
+        self.write_log(f"⚠️ [SYNC-RESET] 清空本地残留持仓状态 reason={reason} pos={self.pos}")
+        self.pos = 0
+        self.entry_price = 0.0
+        self.entry_time = None
+        self.entry_volume = 0
+        self.entry_direction = None
+        self.exit_in_progress = False
+        self._limit_tp_order_ids.clear()
+        self._need_submit_limit_tp = False
+        self._limit_tp_retry_count = 0
+        self._limit_tp_submit_after = None
+        self._pending_tp_price = 0.0
+        self._pending_tp_volume = 0
+        self._pending_tp_direction = None
+        self._position_poll_start_time = None
+        self._last_position_poll_time = None
+        self._entry_sync_failed = False
+        self._entry_sync_warned = False
+        self._last_entry_sync_attempt_dt = None
+        self._entry_sync_missing_position_count = 0
+
+    def _load_broker_positions(self) -> List[object]:
+        """Load broker positions with exact query first, then full scan fallback."""
+        me = getattr(getattr(self, "cta_engine", None), "main_engine", None)
+        if me is None:
+            return []
+
+        positions: List[object] = []
+        try:
+            vt_positionid = f"{self.vt_symbol}.{self.gateway_name}"
+            position = me.get_position(vt_positionid)
+            if position:
+                positions = [position]
+        except Exception:
+            positions = []
+
+        if not positions:
+            if hasattr(me, "get_all_positions"):
+                positions = me.get_all_positions() or []
+            elif hasattr(me, "get_positions"):
+                positions = me.get_positions() or []
+            elif hasattr(me, "get_all_active_positions"):
+                positions = me.get_all_active_positions() or []
+
+        return positions
+
+    def _get_matching_broker_positions(self, positions: Optional[List[object]] = None) -> List[object]:
+        """Return broker positions that match the current strategy symbol and have non-zero volume."""
+        if positions is None:
+            positions = self._load_broker_positions()
+
+        symbol = self.vt_symbol.split(".")[0]
+        matches: List[object] = []
+        for position in positions:
+            vt_symbol = getattr(position, "vt_symbol", "") or ""
+            pos_symbol = getattr(position, "symbol", "") or ""
+            if vt_symbol:
+                if vt_symbol != self.vt_symbol:
+                    continue
+            elif pos_symbol != symbol:
+                continue
+
+            volume = abs(int(getattr(position, "volume", 0) or 0))
+            if volume <= 0:
+                continue
+            matches.append(position)
+
+        return matches
+
+    def _has_live_limit_tp(self) -> bool:
+        """Whether the strategy already has a live/pending TP workflow."""
+        if self._need_submit_limit_tp and self._pending_tp_price > 0 and self._pending_tp_volume > 0:
+            return True
+        if self._limit_tp_order_ids:
+            return True
+        for meta in self.active_orders.values():
+            if meta.purpose == OrderPurpose.LIMIT_TP.value:
+                return True
+        return False
+
+    def _schedule_limit_tp_for_existing_position(self, reason: str) -> bool:
+        """Rebuild TP state for broker-side positions restored after restart/missed trade callbacks."""
+        if not self.enable_limit_tp_order or self.pos == 0 or self.entry_price <= 0:
+            return False
+        if self.exit_in_progress or self._has_live_limit_tp():
+            return False
+
+        matches = self._get_matching_broker_positions()
+        if not matches:
+            return False
+
+        current_pos = abs(int(self.pos))
+        broker_pos = max(abs(int(getattr(p, "volume", 0) or 0)) for p in matches)
+        if broker_pos <= 0:
+            return False
+
+        volume = min(current_pos, broker_pos)
+        if volume <= 0:
+            return False
+
+        if self.entry_direction is None:
+            self.entry_direction = Direction.LONG if self.pos > 0 else Direction.SHORT
+
+        pt_contract = self.price_tick if self.price_tick > 0 else 1.0
+        if self._price_tick_verified:
+            pt = pt_contract
+        else:
+            pt = max(pt_contract, self._get_tse_pricetick(self.entry_price))
+
+        if self.entry_direction == Direction.LONG:
+            tp_price = self.entry_price + self.limit_tp_ticks * pt
+            tp_price = round(tp_price / pt) * pt
+            self._pending_tp_direction = Direction.SHORT
+            side = "卖"
+        else:
+            tp_price = self.entry_price - self.limit_tp_ticks * pt
+            tp_price = round(tp_price / pt) * pt
+            self._pending_tp_direction = Direction.LONG
+            side = "买"
+
+        self._pending_tp_price = tp_price
+        self._pending_tp_volume = volume
+        self._need_submit_limit_tp = True
+        self._limit_tp_retry_count = 0
+        self._limit_tp_submit_after = datetime.now() + timedelta(seconds=max(0.5, self.limit_tp_delay_seconds))
+        self._position_poll_start_time = None
+        self._last_position_poll_time = None
+
+        self.write_log(
+            f"🧩 [恢复TP] 检测到存量持仓，重建{side}止盈计划 @{tp_price:.2f} "
+            f"vol={volume} entry={self.entry_price:.2f} reason={reason}"
+        )
+        return True
+
     # =========================
     # 生命周期
     # =========================
     def on_init(self):
+        self._apply_runtime_safety_overrides()
         self.price_tick = self._load_pricetick_or_fallback()
         self._parse_time_filters()
         self.write_log("=" * 80)
@@ -468,6 +651,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self.write_log(f"手续费率: {self.commission_rate*100:.3f}%, 滑点: {self.slippage_ticks} ticks")
         self.write_log(f"Flow Flip: {'开启' if self.use_flow_flip_exit else '关闭'}")
         self.write_log(f"Microprice Momentum: {'开启' if self.use_microprice_momentum else '关闭'}")
+        if self.tp_only_mode and not self.enable_max_loss_per_trade_exit:
+            self.write_log("⚠️ 高风险配置: tp_only_mode=True 且 enable_max_loss_per_trade_exit=False，亏损仓位不会自动退出")
         self.write_log("=" * 80)
         self.put_event()
 
@@ -513,11 +698,19 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 if hasattr(contract, 'pricetick') and contract.pricetick > 0:
                     old_tick = self.price_tick
                     self.price_tick = float(contract.pricetick)
-                    self._price_tick_verified = True  # 标记已验证
-                    if old_tick != self.price_tick:
-                        self.write_log(f"   🔧 价位已纠正: {old_tick} → {self.price_tick}")
+                    if self.price_tick == 1.0:
+                        # kabu 合约经常回默认 1.0；先保留数值，但等待实时盘口再确认是否存在 0.1/0.01 级 tick。
+                        self._price_tick_verified = False
+                        if old_tick != self.price_tick:
+                            self.write_log(f"   🔧 价位待实时校验: {old_tick} → {self.price_tick}")
+                        else:
+                            self.write_log(f"   价位待实时校验: {self.price_tick}")
                     else:
-                        self.write_log(f"   价位已验证: {self.price_tick}")
+                        self._price_tick_verified = True  # 标记已验证
+                        if old_tick != self.price_tick:
+                            self.write_log(f"   🔧 价位已纠正: {old_tick} → {self.price_tick}")
+                        else:
+                            self.write_log(f"   价位已验证: {self.price_tick}")
         except Exception as e:
             self.write_log(f"⚠️  合约检查异常: {e}")
 
@@ -531,13 +724,33 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # =========================
     # price_tick 自动纠偏
     # =========================
-    def _periodic_verify_price_tick(self, live_price: float = 0.0):
+    @staticmethod
+    def _infer_quote_price_tick(*prices: float) -> float:
+        """Infer sub-1 price tick from live quote precision when the gateway reports 1.0."""
+        candidates: List[float] = []
+        for price in prices:
+            px = float(price or 0.0)
+            if px <= 0:
+                continue
+            text = f"{px:.6f}".rstrip("0").rstrip(".")
+            if "." not in text:
+                continue
+            frac_len = len(text.split(".", 1)[1])
+            if frac_len <= 0:
+                continue
+            step = 10 ** (-frac_len)
+            if 0 < step < 1.0:
+                candidates.append(float(step))
+        return min(candidates) if candidates else 0.0
+
+    def _periodic_verify_price_tick(self, live_price: float = 0.0, tick: TickData = None):
         """周期性验证 price_tick（每30秒检查一次）。
 
         优先顺序：
         1. 合约 pricetick > 1.0 → 直接采用，标记已验证
-        2. 合约 pricetick == 1.0 且 live_price ≥ 3000 → TSE 呼値表推断
-        3. 合约不可用 且 live_price > 0 → TSE 呼値表推断
+        2. 合约 pricetick == 1.0 且实时盘口存在小数精度 → 用盘口精度推断 0.1/0.01 级 tick
+        3. 合约 pricetick == 1.0 且 live_price ≥ 3000 → TSE 呼値表推断
+        4. 合约不可用 且 live_price > 0 → TSE 呼値表推断
         """
         now = datetime.now()
         # 节流：每30秒检查一次（即使已验证也继续，避免价格跨级时不更新）
@@ -561,7 +774,14 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                     self._price_tick_verified = True
                 else:
                     # contract_tick == 1.0：kabu gateway 默认值，需要 TSE 表二次确认
-                    if live_price >= 3_000:
+                    bid1 = float(getattr(tick, "bid_price_1", 0.0) or 0.0) if tick is not None else 0.0
+                    ask1 = float(getattr(tick, "ask_price_1", 0.0) or 0.0) if tick is not None else 0.0
+                    quote_tick = self._infer_quote_price_tick(bid1, ask1, live_price)
+                    if 0 < quote_tick < 1.0:
+                        inferred = quote_tick
+                        source = f"盘口精度({bid1:.3f}/{ask1:.3f})"
+                        self._price_tick_verified = True
+                    elif live_price >= 3_000:
                         inferred = self._get_tse_pricetick(live_price)
                         source = f"TSE表({live_price:.0f}→{inferred})"
                         if inferred > 1.0:
@@ -653,7 +873,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         _live_px = float(getattr(tick_used, "last_price", 0.0) or 0.0)
         if _live_px <= 0:
             _live_px = float(getattr(tick_used, "bid_price_1", 0.0) or 0.0)
-        self._periodic_verify_price_tick(live_price=_live_px)
+        self._periodic_verify_price_tick(live_price=_live_px, tick=tick_used)
 
         self._check_new_day(tick_used.datetime)
         self._update_indicators(tick_used)
@@ -688,6 +908,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     def on_timer(self):
         if not self.trading:
             return
+
         if self.max_tick_stale_seconds <= 0:
             return
         if self.last_recv_time is None:
@@ -696,6 +917,11 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         # 用tick时间判断交易时段(而非本机时间,避免时区问题)
         if self.last_tick_time and not self._is_trading_time(self.last_tick_time):
             return
+
+        # 没有新tick时也允许由timer驱动延迟TP提交，避免冷门股等待到下一个tick才挂单。
+        if self._need_submit_limit_tp and self._limit_tp_submit_after is not None:
+            if datetime.now() >= self._limit_tp_submit_after:
+                self._try_submit_limit_tp_order_delayed()
 
         # 用墙上时钟检测feed stale(这是正确的)
         now = datetime.now()
@@ -786,15 +1012,22 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 self._limit_tp_order_ids.clear()
 
                 # 2. 计算止盈价（使用加权平均成交价 + 1tick）
-                # ⚠️ 用 TSE 表二次确认价位：避免 contract.pricetick=1.0 伪装导致非法价位（如 3256 而非 3260）
+                # v3 fix: _price_tick_verified=True 时直接信任已验证的 price_tick，
+                # 避免 TSE 表推断值（如 1.0）错误覆盖已纠偏的小数 tick（如 0.1）。
+                # 只有未经验证时才用 TSE 表兜底。
                 pt_contract = self.price_tick if self.price_tick > 0 else 1.0
-                pt_tse = self._get_tse_pricetick(self.entry_price)
-                pt = max(pt_contract, pt_tse)  # 取较大值（更保守，确保合法）
-                if pt != pt_contract:
-                    self.write_log(
-                        f"⚠️ [TP价位] 合约pricetick={pt_contract} 但TSE表推断={pt_tse}，"
-                        f"将使用 {pt}¥ 计算TP（原合约值可能不可信）"
-                    )
+                if self._price_tick_verified:
+                    # ✅ 已由合约或 _periodic_verify_price_tick 确认，直接使用
+                    pt = pt_contract
+                else:
+                    # 未验证：用 TSE 表推断做保底（取较大值，避免非法价位如 3256 而非 3260）
+                    pt_tse = self._get_tse_pricetick(self.entry_price)
+                    pt = max(pt_contract, pt_tse)
+                    if pt != pt_contract:
+                        self.write_log(
+                            f"⚠️ [TP价位] price_tick未验证，合约={pt_contract} TSE推断={pt_tse}，"
+                            f"将使用 {pt}¥ 计算TP（建议让 price_tick 自动验证后再开仓）"
+                        )
 
                 if self.entry_direction == Direction.LONG:
                     # 多头：成本价 + 1tick（确保对齐到 TSE 合法价位）
@@ -846,8 +1079,16 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             return
 
         # 平仓
+        close_fill_pnl = 0.0
         if self.entry_price > 0:
-            self._trade_realized_pnl += self._calc_close_trade_pnl(trade.price, vol, trade.direction)
+            close_fill_pnl = self._calc_close_trade_pnl(trade.price, vol, trade.direction)
+            self._trade_realized_pnl += close_fill_pnl
+
+        _close_act = "卖平" if trade.direction == Direction.SHORT else "买平"
+        self.write_log(
+            f"[FILL平] {_close_act}{vol}@{float(trade.price):.0f} "
+            f"本次{close_fill_pnl:+.0f}¥ 累计已实现{self._trade_realized_pnl:+.0f}¥ pos={self.pos}"
+        )
 
         if self.pos == 0 and self.entry_time is not None:
             self._finalize_flat(trade.datetime)
@@ -872,29 +1113,17 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             bool: True=持仓已同步，可以挂止盈单；False=未同步，继续等待
         """
         try:
-            # 尝试获取持仓信息
-            me = getattr(getattr(self, "cta_engine", None), "main_engine", None)
-            if not me:
-                return False  # 无法获取引擎，继续等待
-
-            # 获取当前持仓
-            vt_positionid = f"{self.vt_symbol}.{self.gateway_name}"
-            position = me.get_position(vt_positionid)
-
-            if not position:
-                # 持仓数据未加载，继续等待
+            positions = self._load_broker_positions()
+            if not positions:
                 return False
 
-            # 检查持仓数量是否>=预期开仓量
-            expected_volume = abs(self._pending_tp_volume)
-            actual_volume = abs(int(position.volume or 0))
+            expected_volume = abs(int(self._pending_tp_volume or 0))
+            for position in self._get_matching_broker_positions(positions):
+                actual_volume = abs(int(getattr(position, "volume", 0) or 0))
+                if actual_volume >= expected_volume > 0:
+                    return True
 
-            if actual_volume >= expected_volume:
-                # 持仓已同步
-                return True
-            else:
-                # 持仓数量不足，继续等待
-                return False
+            return False
 
         except Exception as e:
             # 异常时返回False，继续等待
@@ -909,50 +1138,13 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tick: 当前TickData，当持仓price=0时用tick价格作为entry_price的fallback
         """
         try:
-            me = getattr(getattr(self, "cta_engine", None), "main_engine", None)
-            if me is None:
-                return False
-
-            positions = []
-            if hasattr(me, "get_all_positions"):
-                positions = me.get_all_positions()
-            elif hasattr(me, "get_positions"):
-                positions = me.get_positions()
-            elif hasattr(me, "get_all_active_positions"):
-                positions = me.get_all_active_positions()
-
+            positions = self._load_broker_positions()
             if not positions:
-                # 没有持仓数据：用tick价格作为entry_price的最后兜底
-                if tick is not None and self.pos != 0:
-                    bid1, ask1 = self._get_bid_ask_1(tick)
-                    last_px = float(tick.last_price or 0.0)
-                    # 根据持仓方向选择合适的参考价
-                    if self.pos > 0:
-                        px = bid1 if bid1 > 0 else last_px
-                    else:
-                        px = ask1 if ask1 > 0 else last_px
-                    if px > 0:
-                        self.entry_price = px
-                        self.entry_volume = abs(int(self.pos))
-                        self.entry_time = getattr(self, "last_tick_time", None) or datetime.now()
-                        self.write_log(
-                            f"🩹 [SYNC-TICK] 持仓数据为空，用tick价格恢复 entry_price={px:.2f} "
-                            f"entry_vol={self.entry_volume} pos={self.pos} reason={reason}"
-                        )
-                        return True
+                if self.verbose_log:
+                    self.write_log(f"🩹 [SYNC-SKIP] 账户持仓列表为空，跳过 entry 恢复 reason={reason}")
                 return False
 
-            for p in positions:
-                vt_symbol = getattr(p, "vt_symbol", "") or ""
-                symbol = getattr(p, "symbol", "") or ""
-
-                if vt_symbol:
-                    if vt_symbol != self.vt_symbol:
-                        continue
-                else:
-                    if symbol != self.vt_symbol.split(".")[0]:
-                        continue
-
+            for p in self._get_matching_broker_positions(positions):
                 vol = float(getattr(p, "volume", 0) or 0)
                 if abs(vol) <= 0:
                     continue
@@ -981,35 +1173,22 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 self.entry_volume = abs(int(vol))
                 dt = getattr(self, "last_tick_time", None) or datetime.now()
                 self.entry_time = dt
+                self.entry_direction = Direction.LONG if vol > 0 else Direction.SHORT
                 # 同步成功后重置警告状态，允许后续再次同步
                 self._entry_sync_failed = False
                 self._entry_sync_warned = False
+                self._last_entry_sync_attempt_dt = None
+                self._entry_sync_missing_position_count = 0
 
                 self.write_log(
                     f"🩹 [SYNC] 恢复 entry 信息: entry_price={self.entry_price:.2f} "
                     f"entry_vol={self.entry_volume} pos={self.pos} reason={reason}"
                 )
+                self._schedule_limit_tp_for_existing_position(f"sync:{reason}")
                 return True
 
-            # for循环结束但没找到匹配持仓（账户里没有该合约的持仓，如3350策略持仓但账户只有5032）
-            # → 直接用tick实时价格作为entry_price兜底，让止损止盈能正常运行
-            if tick is not None and self.pos != 0:
-                bid1, ask1 = self._get_bid_ask_1(tick)
-                last_px = float(tick.last_price or 0.0)
-                if self.pos > 0:
-                    px = bid1 if bid1 > 0 else last_px
-                else:
-                    px = ask1 if ask1 > 0 else last_px
-                if px > 0:
-                    self.entry_price = px
-                    self.entry_volume = abs(int(self.pos))
-                    self.entry_time = getattr(self, "last_tick_time", None) or datetime.now()
-                    self.write_log(
-                        f"🩹 [SYNC-TICK] 账户无匹配持仓({self.vt_symbol})，用tick实时价格恢复 "
-                        f"entry_price={px:.2f} entry_vol={self.entry_volume} pos={self.pos} "
-                        f"⚠️ 注意：此价格为恢复时的实时价，非真实成交价！"
-                    )
-                    return True
+            if self.verbose_log:
+                self.write_log(f"🩹 [SYNC-SKIP] 账户无匹配持仓({self.vt_symbol})，拒绝使用tick伪造 entry 信息")
 
         except Exception as e:
             self.write_log(f"🩹 [SYNC] 尝试从持仓恢复 entry 信息失败: {e}")
@@ -1102,9 +1281,23 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
     def _check_long_signal(self) -> bool:
         """
-        检查多头信号是否满足（3主+1辅门控）
-        主要指标: book_imbalance / lob_of_imbalance / micro_momentum（全部必须）
-        次级指标: tape_ofi / microprice_tilt（满足min_secondary_score个即可）
+        检查多头信号是否满足。
+
+        [v3 - 2026-03-17] 信号结构重构（QUEUE市场适配）
+        ─────────────────────────────────────────────────
+        旧逻辑 (v2): 主信号 = book AND of AND mom（3个全必须）
+                     次级信号 = tape OR mpt（满足>=1）
+          问题: TSE QUEUE 模式下(spread=1tick，占全天95%)，
+                book 与 of 相关系数≈0.17，book 强时 of 反而偏负(74%)，
+                mom 在价格不动时恒为0，导致三者同时满足概率≈0%。
+
+        新逻辑 (v3): 主信号 = book AND tape（被动盘口 + 主动成交双确认）
+                     次级信号 = of OR mom OR mpt（满足>=1，阈值降低）
+          理由: tape(实际成交)是QUEUE市场最可靠的主动意图信号；
+                of/mom/mpt降为辅助验证，避免三者相互拮抗永远不触发。
+
+        若 use_tape_ofi=False（tape被禁用），自动回退到 v2 逻辑（book+of+mom），
+        以兼容不支持 tape 的环境。
         """
         book_imb = self.book_imbalance
         of_imb = self.lob_of_imbalance
@@ -1112,28 +1305,50 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 主要指标（全部必须满足）
-        primary_ok = (
-            self.enable_long
-            and book_imb >= self.book_imbalance_long
-            and of_imb >= self.of_imbalance_long
-            and mom >= self.mom_long_threshold
-        )
-        if not primary_ok:
-            return False
+        if self.use_tape_ofi:
+            # v3 主要指标: book（被动盘口厚度）+ tape（主动成交方向）
+            # 大 bid 墙（book 强）+ 实际买单涌入（tape 强）= 可信多头
+            primary_ok = (
+                self.enable_long
+                and book_imb >= self.book_imbalance_long
+                and tape_imb >= self.tape_imbalance_long
+            )
+            if not primary_ok:
+                return False
 
-        # 次级指标（满足min_secondary_score个即可）
-        secondary_score = 0
-        if self.use_tape_ofi and tape_imb >= self.tape_imbalance_long:
-            secondary_score += 1
-        if self.use_microprice_tilt and mpt >= self.microprice_tilt_long:
-            secondary_score += 1
+            # v3 次级指标: of / mom / mpt（降阈值，满足 >= min_secondary_score 个）
+            # 三者任意一个正向偏离，说明除盘口外还有额外多头动力
+            secondary_score = 0
+            if of_imb >= self.of_imbalance_long:           # LOB-OFI: 最近挂单增量偏多
+                secondary_score += 1
+            if mom >= self.mom_long_threshold:             # 动量: microprice 上行
+                secondary_score += 1
+            if self.use_microprice_tilt and mpt >= self.microprice_tilt_long:  # mpt: 即时买压
+                secondary_score += 1
+        else:
+            # tape 被禁用时回退 v2 逻辑（book + of + mom 全必须）
+            primary_ok = (
+                self.enable_long
+                and book_imb >= self.book_imbalance_long
+                and of_imb >= self.of_imbalance_long
+                and mom >= self.mom_long_threshold
+            )
+            if not primary_ok:
+                return False
+            secondary_score = 0
+            if self.use_microprice_tilt and mpt >= self.microprice_tilt_long:
+                secondary_score += 1
 
         return secondary_score >= self.min_secondary_score
 
     # 🚀 v2优化: 信号强度检查
     def _is_strong_long_signal(self) -> bool:
-        """检查是否为强多头信号（所有指标远超阈值）"""
+        """
+        检查是否为强多头信号（主信号远超阈值 + 次级信号至少一个也超强）。
+
+        [v3] 与 _check_long_signal 保持一致的主/次信号分层结构：
+        强信号条件 = 主信号（book + tape）均超 multiplier 倍 AND 次级至少 1 个也超 multiplier 倍
+        """
         if not self.use_adaptive_confirm:
             return False
 
@@ -1144,23 +1359,36 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 所有指标都需要超过阈值*倍数
-        strong = (
-            book_imb >= self.book_imbalance_long * multiplier
-            and of_imb >= self.of_imbalance_long * multiplier
-            and mom >= self.mom_long_threshold * multiplier
-        )
-
         if self.use_tape_ofi:
-            strong = strong and (tape_imb >= self.tape_imbalance_long * multiplier)
-
-        if self.use_microprice_tilt:
-            strong = strong and (mpt >= self.microprice_tilt_long * multiplier)
-
-        return strong
+            # v3: 强信号以主信号（book + tape）为基础
+            primary_strong = (
+                book_imb >= self.book_imbalance_long * multiplier
+                and tape_imb >= self.tape_imbalance_long * multiplier
+            )
+            # 次级至少一个也超强，说明动力充足
+            secondary_strong = (
+                of_imb >= self.of_imbalance_long * multiplier
+                or mom >= self.mom_long_threshold * multiplier
+                or (self.use_microprice_tilt and mpt >= self.microprice_tilt_long * multiplier)
+            )
+            return primary_strong and secondary_strong
+        else:
+            # tape 禁用时回退 v2 逻辑（三主信号全部超强）
+            strong = (
+                book_imb >= self.book_imbalance_long * multiplier
+                and of_imb >= self.of_imbalance_long * multiplier
+                and mom >= self.mom_long_threshold * multiplier
+            )
+            if self.use_microprice_tilt:
+                strong = strong and (mpt >= self.microprice_tilt_long * multiplier)
+            return strong
 
     def _is_strong_short_signal(self) -> bool:
-        """检查是否为强空头信号（所有指标远超阈值）"""
+        """
+        检查是否为强空头信号。
+
+        [v3] 与 _is_strong_long_signal 对称，详见多头注释。
+        """
         if not self.use_adaptive_confirm:
             return False
 
@@ -1171,26 +1399,36 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 所有指标都需要超过阈值*倍数
-        strong = (
-            book_imb <= -self.book_imbalance_short * multiplier
-            and of_imb <= -self.of_imbalance_short * multiplier
-            and mom <= -self.mom_short_threshold * multiplier
-        )
-
         if self.use_tape_ofi:
-            strong = strong and (tape_imb <= -self.tape_imbalance_short * multiplier)
-
-        if self.use_microprice_tilt:
-            strong = strong and (mpt <= -self.microprice_tilt_short * multiplier)
-
-        return strong
+            # v3: 强空头信号
+            primary_strong = (
+                book_imb <= -self.book_imbalance_short * multiplier
+                and tape_imb <= -self.tape_imbalance_short * multiplier
+            )
+            secondary_strong = (
+                of_imb <= -self.of_imbalance_short * multiplier
+                or mom <= -self.mom_short_threshold * multiplier
+                or (self.use_microprice_tilt and mpt <= -self.microprice_tilt_short * multiplier)
+            )
+            return primary_strong and secondary_strong
+        else:
+            # tape 禁用时回退 v2 逻辑
+            strong = (
+                book_imb <= -self.book_imbalance_short * multiplier
+                and of_imb <= -self.of_imbalance_short * multiplier
+                and mom <= -self.mom_short_threshold * multiplier
+            )
+            if self.use_microprice_tilt:
+                strong = strong and (mpt <= -self.microprice_tilt_short * multiplier)
+            return strong
 
     def _check_short_signal(self) -> bool:
         """
-        检查空头信号是否满足（3主+1辅门控）
-        主要指标: book_imbalance / lob_of_imbalance / micro_momentum（全部必须）
-        次级指标: tape_ofi / microprice_tilt（满足min_secondary_score个即可）
+        检查空头信号是否满足。
+
+        [v3 - 2026-03-17] 与 _check_long_signal 对称，详见多头注释。
+        主信号 = book（ask 盘口厚）AND tape（主动卖单涌入）
+        次级信号 = of OR mom OR mpt（满足 >= min_secondary_score 个）
         """
         book_imb = self.book_imbalance
         of_imb = self.lob_of_imbalance
@@ -1198,22 +1436,37 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         tape_imb = self.tape_of_imbalance if self.use_tape_ofi else 0.0
         mpt = self.microprice_tilt if self.use_microprice_tilt else 0.0
 
-        # 主要指标（全部必须满足）
-        primary_ok = (
-            self.enable_short
-            and book_imb <= -self.book_imbalance_short
-            and of_imb <= -self.of_imbalance_short
-            and mom <= -self.mom_short_threshold
-        )
-        if not primary_ok:
-            return False
+        if self.use_tape_ofi:
+            # v3 主要指标（空头）: book（ask 侧厚）+ tape（主动卖单方向）
+            primary_ok = (
+                self.enable_short
+                and book_imb <= -self.book_imbalance_short
+                and tape_imb <= -self.tape_imbalance_short
+            )
+            if not primary_ok:
+                return False
 
-        # 次级指标（满足min_secondary_score个即可）
-        secondary_score = 0
-        if self.use_tape_ofi and tape_imb <= -self.tape_imbalance_short:
-            secondary_score += 1
-        if self.use_microprice_tilt and mpt <= -self.microprice_tilt_short:
-            secondary_score += 1
+            # v3 次级指标（空头）: of / mom / mpt（满足 >= min_secondary_score 个）
+            secondary_score = 0
+            if of_imb <= -self.of_imbalance_short:
+                secondary_score += 1
+            if mom <= -self.mom_short_threshold:
+                secondary_score += 1
+            if self.use_microprice_tilt and mpt <= -self.microprice_tilt_short:
+                secondary_score += 1
+        else:
+            # tape 被禁用时回退 v2 逻辑
+            primary_ok = (
+                self.enable_short
+                and book_imb <= -self.book_imbalance_short
+                and of_imb <= -self.of_imbalance_short
+                and mom <= -self.mom_short_threshold
+            )
+            if not primary_ok:
+                return False
+            secondary_score = 0
+            if self.use_microprice_tilt and mpt <= -self.microprice_tilt_short:
+                secondary_score += 1
 
         return secondary_score >= self.min_secondary_score
 
@@ -1245,24 +1498,14 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
         # 2. price_tick验证（保留原有的自动修复逻辑）
         if not self._price_tick_verified:
-            if self.price_tick <= 0 or self.price_tick == 1.0:
-                try:
-                    main_engine = self.cta_engine.main_engine
-                    contract = main_engine.get_contract(self.vt_symbol)
-                    if contract and hasattr(contract, 'pricetick') and contract.pricetick > 0:
-                        self.price_tick = float(contract.pricetick)
-                        self._price_tick_verified = True
-                        self.write_log(f"🔧 [FIX] price_tick 已验证并更新: {self.price_tick}")
-                    else:
-                        self._gate_log(f'price_tick无效({self.price_tick})，禁止开仓', tick.datetime)
-                        self._reset_confirm()
-                        return
-                except Exception as e:
-                    self._gate_log(f'price_tick加载失败({e})，禁止开仓', tick.datetime)
-                    self._reset_confirm()
-                    return
-            else:
-                self._price_tick_verified = True
+            live_px = float(getattr(tick, "last_price", 0.0) or 0.0)
+            if live_px <= 0:
+                live_px = float(getattr(tick, "bid_price_1", 0.0) or 0.0)
+            self._periodic_verify_price_tick(live_price=live_px, tick=tick)
+            if not self._price_tick_verified or self.price_tick <= 0:
+                self._gate_log(f'price_tick未验证({self.price_tick})，禁止开仓', tick.datetime)
+                self._reset_confirm()
+                return
 
         # 3. 市场质量检查（✅ 重构：调用统一的验证函数）
         is_valid, reason = self._validate_market_quality(tick)
@@ -1486,8 +1729,13 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         # 如果已经有持仓但 entry 信息缺失，优先尝试从 PositionData 恢复；否则打印诊断提示
         if self.pos != 0 and (self.entry_time is None or self.entry_price <= 0):
             recovered = False
-            # 只在之前未成功恢复时才尝试（每tick都尝试浪费性能）
-            if not self._entry_sync_failed:
+            now_for_sync = datetime.now()
+            should_retry_sync = (
+                self._last_entry_sync_attempt_dt is None
+                or (now_for_sync - self._last_entry_sync_attempt_dt).total_seconds() >= self.ENTRY_SYNC_RETRY_INTERVAL
+            )
+            if should_retry_sync:
+                self._last_entry_sync_attempt_dt = now_for_sync
                 try:
                     recovered = self._try_sync_entry_from_positions(reason="entry_missing_on_exit_check", tick=tick)
                 except Exception:
@@ -1495,6 +1743,16 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
                 if not recovered:
                     self._entry_sync_failed = True
+                    positions = self._load_broker_positions()
+                    matches = self._get_matching_broker_positions(positions)
+                    # 多次确认 broker 端没有该合约持仓后，清空本地残留状态，避免策略永久卡死在 pos!=0。
+                    if positions and not matches and not self.active_orders and not self._has_live_limit_tp():
+                        self._entry_sync_missing_position_count += 1
+                        if self._entry_sync_missing_position_count >= self.ENTRY_SYNC_CLEAR_MISSES:
+                            self._clear_stale_local_position("broker_position_absent_after_restart")
+                            return
+                    else:
+                        self._entry_sync_missing_position_count = 0
 
             if not recovered:
                 # WARNING只打印一次，之后静默跳过（避免每个tick刷屏）
@@ -1510,6 +1768,9 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
         if self.entry_time is None or self.entry_price <= 0:
             return
+
+        if self.tp_only_mode and self.enable_limit_tp_order:
+            self._schedule_limit_tp_for_existing_position("existing_position_without_tp")
 
         # ========================================================================
         # 🔴 兜底止损检查 (优先级最高,即使tp_only_mode=True也执行)
@@ -2143,6 +2404,18 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             self._need_submit_limit_tp = False
             return
 
+        current_pos = abs(int(self.pos))
+        if current_pos <= 0:
+            self.write_log("⚠️ [TP取消] 当前无持仓，取消待提交TP")
+            self._need_submit_limit_tp = False
+            self._pending_tp_volume = 0
+            self._pending_tp_price = 0.0
+            self._pending_tp_direction = None
+            return
+
+        # 待挂TP数量不能超过当前剩余持仓，避免手动减仓/部分平仓后挂出过量TP。
+        self._pending_tp_volume = min(int(self._pending_tp_volume), current_pos)
+
         # 检查重试次数：5次快速重试失败后，切换为"慢速重试"模式（每30s再试一次，最多再试10次）
         # 这是为了应对 KABU 建玉状态同步延迟导致的拒单（HTTP 200 但无 OrderId）
         if self._limit_tp_retry_count >= 5:
@@ -2213,14 +2486,17 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
         # 提交订单（先做价位合法性校验，防止非法价格反复被拒单）
         try:
-            # ⚠️ 每次提交前用 TSE 表重验价位：
-            # 若 _pending_tp_price 不是合法价位（如 3256 而非 3260），自动纠正
-            _pt_ref = self._get_tse_pricetick(self._pending_tp_price)
+            # v3 fix: 与 on_trade 一致——_price_tick_verified=True 时直接信任已验证值，
+            # 避免 TSE 表推断（如 1.0）错误覆盖已纠偏的小数 tick（如 0.1 → 653.80 变 654.00）。
+            if self._price_tick_verified and self.price_tick > 0:
+                _pt_ref = self.price_tick
+            else:
+                _pt_ref = self._get_tse_pricetick(self._pending_tp_price)
             _snapped = round(self._pending_tp_price / _pt_ref) * _pt_ref
             if abs(_snapped - self._pending_tp_price) > 0.01:
                 self.write_log(
                     f"🔧 [TP价位校正] {self._pending_tp_price:.0f} → {_snapped:.0f}"
-                    f" (TSE pricetick={_pt_ref}¥，原价非法)"
+                    f" (pricetick={_pt_ref}¥，原价非法)"
                 )
                 self._pending_tp_price = _snapped
 

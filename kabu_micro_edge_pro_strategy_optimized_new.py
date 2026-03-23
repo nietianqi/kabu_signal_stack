@@ -114,6 +114,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     # 启动后持仓恢复
     ENTRY_SYNC_RETRY_INTERVAL = 1.0           # entry 恢复失败后的重试间隔（秒）
     ENTRY_SYNC_CLEAR_MISSES = 3               # 连续确认 broker 无仓后清理本地残留状态
+    POSITION_RECONCILE_INTERVAL = 1.0         # broker/local 持仓对账间隔（秒）
 
     # 连亏计数
     CONTINUOUS_LOSS_COUNT_THRESHOLD = 5       # 连亏次数阈值（用于日志显示）
@@ -405,6 +406,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self._entry_sync_warned: bool = False   # 是否已打印过EXIT-SKIP警告
         self._last_entry_sync_attempt_dt: Optional[datetime] = None
         self._entry_sync_missing_position_count: int = 0
+        self._last_position_reconcile_dt: Optional[datetime] = None
 
         # LOB 内存
         self._prev_bid_prices: List[float] = []
@@ -543,6 +545,20 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
         return positions
 
+    @staticmethod
+    def _signed_position_volume(position: object) -> int:
+        """Convert broker PositionData into signed local volume."""
+        raw_volume = int(float(getattr(position, "volume", 0) or 0))
+        if raw_volume == 0:
+            return 0
+
+        direction = getattr(position, "direction", None)
+        if direction == Direction.SHORT:
+            return -abs(raw_volume)
+        if direction == Direction.LONG:
+            return abs(raw_volume)
+        return raw_volume
+
     def _get_matching_broker_positions(self, positions: Optional[List[object]] = None) -> List[object]:
         """Return broker positions that match the current strategy symbol and have non-zero volume."""
         if positions is None:
@@ -565,6 +581,111 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             matches.append(position)
 
         return matches
+
+    def _summarize_broker_position(self, positions: Optional[List[object]] = None) -> Tuple[int, float, List[object]]:
+        """Return broker net position, weighted average price and matched position records."""
+        matches = self._get_matching_broker_positions(positions)
+        if not matches:
+            return 0, 0.0, []
+
+        net_volume = 0
+        price_sum = 0.0
+        abs_volume_sum = 0
+
+        for position in matches:
+            signed_volume = self._signed_position_volume(position)
+            if signed_volume == 0:
+                continue
+
+            net_volume += signed_volume
+
+            price = float(getattr(position, "price", 0) or 0)
+            if price <= 0:
+                price = float(getattr(position, "open_price", 0) or 0) or float(getattr(position, "avg_price", 0) or 0)
+            if price > 0:
+                price_sum += abs(signed_volume) * price
+                abs_volume_sum += abs(signed_volume)
+
+        avg_price = (price_sum / abs_volume_sum) if abs_volume_sum > 0 else 0.0
+        return net_volume, avg_price, matches
+
+    def _reconcile_local_position_with_broker(
+        self,
+        reason: str,
+        tick: Optional[TickData] = None,
+        force: bool = False,
+    ) -> bool:
+        """Use broker positions as source of truth and repair local cached state."""
+        now = datetime.now()
+        if (
+            not force
+            and self._last_position_reconcile_dt is not None
+            and (now - self._last_position_reconcile_dt).total_seconds() < self.POSITION_RECONCILE_INTERVAL
+        ):
+            return False
+
+        self._last_position_reconcile_dt = now
+        positions = self._load_broker_positions()
+        if not positions:
+            return False
+
+        broker_pos, broker_avg_price, matches = self._summarize_broker_position(positions)
+        local_pos = int(self.pos or 0)
+
+        if broker_pos == 0:
+            if local_pos != 0 and not self.active_orders and not self._has_live_limit_tp():
+                self._entry_sync_missing_position_count += 1
+                if self._entry_sync_missing_position_count >= self.ENTRY_SYNC_CLEAR_MISSES:
+                    self._clear_stale_local_position(f"reconcile:{reason}:broker_absent")
+                    return True
+            else:
+                self._entry_sync_missing_position_count = 0
+            return False
+
+        self._entry_sync_missing_position_count = 0
+        broker_direction = Direction.LONG if broker_pos > 0 else Direction.SHORT
+        broker_volume = abs(broker_pos)
+
+        mismatch_parts: List[str] = []
+        if local_pos != broker_pos:
+            mismatch_parts.append(f"pos {local_pos}->{broker_pos}")
+        if self.entry_direction not in (None, broker_direction):
+            mismatch_parts.append(f"dir {self.entry_direction}->{broker_direction}")
+        if self.entry_volume not in (0, broker_volume):
+            mismatch_parts.append(f"entry_volume {self.entry_volume}->{broker_volume}")
+        if self.entry_price <= 0 or self.entry_time is None:
+            mismatch_parts.append("entry_missing")
+
+        if not mismatch_parts:
+            if self.enable_limit_tp_order and not self._has_live_limit_tp():
+                self._schedule_limit_tp_for_existing_position(f"reconcile:{reason}")
+            return False
+
+        self.write_log(
+            f"🔄 [POS-SYNC] broker/local持仓不一致，按broker修正 "
+            f"reason={reason} {'; '.join(mismatch_parts)}"
+        )
+
+        recovered = self._try_sync_entry_from_positions(reason=f"reconcile:{reason}", tick=tick)
+        if recovered:
+            return True
+
+        # entry价格暂时恢复失败时，也要先纠正仓位，防止重复开仓。
+        self.pos = broker_pos
+        self.entry_direction = broker_direction
+        self.entry_volume = broker_volume
+        if self.entry_price <= 0 and broker_avg_price > 0:
+            self.entry_price = broker_avg_price
+        if self.entry_time is None:
+            self.entry_time = getattr(self, "last_tick_time", None) or now
+
+        self.write_log(
+            f"⚠️ [POS-SYNC] 已修正本地仓位到 broker={broker_pos}，"
+            f"entry_price={self.entry_price:.2f} entry_time={self.entry_time}"
+        )
+        if matches and self.enable_limit_tp_order and self.entry_price > 0:
+            self._schedule_limit_tp_for_existing_position(f"reconcile:{reason}:fallback")
+        return True
 
     def _has_live_limit_tp(self) -> bool:
         """Whether the strategy already has a live/pending TP workflow."""
@@ -713,6 +834,11 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                             self.write_log(f"   价位已验证: {self.price_tick}")
         except Exception as e:
             self.write_log(f"⚠️  合约检查异常: {e}")
+
+        try:
+            self._reconcile_local_position_with_broker(reason="start", force=True)
+        except Exception as e:
+            self.write_log(f"⚠️  启动持仓对账异常: {e}")
 
         self.put_event()
 
@@ -882,6 +1008,13 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self._check_new_day(tick_used.datetime)
         self._update_indicators(tick_used)
         self._vlog(self._diag_tick_line(tick_used))
+
+        if self._reconcile_local_position_with_broker(reason="tick", tick=tick_used):
+            self.put_event()
+            if self.pos != 0:
+                self._check_exit(tick_used)
+                self.put_event()
+                return
 
         if self.enable_auto_stop and not self.is_trading_allowed:
             if self.pos != 0:
@@ -1149,8 +1282,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 return False
 
             for p in self._get_matching_broker_positions(positions):
-                vol = float(getattr(p, "volume", 0) or 0)
-                if abs(vol) <= 0:
+                signed_vol = self._signed_position_volume(p)
+                if signed_vol == 0:
                     continue
 
                 px = float(getattr(p, "price", 0) or 0)
@@ -1161,7 +1294,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 if px <= 0 and tick is not None:
                     bid1, ask1 = self._get_bid_ask_1(tick)
                     last_px = float(tick.last_price or 0.0)
-                    if self.pos > 0:
+                    if signed_vol > 0:
                         px = bid1 if bid1 > 0 else last_px
                     else:
                         px = ask1 if ask1 > 0 else last_px
@@ -1173,16 +1306,18 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
                 if px <= 0:
                     continue
 
+                self.pos = signed_vol
                 self.entry_price = px
-                self.entry_volume = abs(int(vol))
+                self.entry_volume = abs(int(signed_vol))
                 dt = getattr(self, "last_tick_time", None) or datetime.now()
                 self.entry_time = dt
-                self.entry_direction = Direction.LONG if vol > 0 else Direction.SHORT
+                self.entry_direction = Direction.LONG if signed_vol > 0 else Direction.SHORT
                 # 同步成功后重置警告状态，允许后续再次同步
                 self._entry_sync_failed = False
                 self._entry_sync_warned = False
                 self._last_entry_sync_attempt_dt = None
                 self._entry_sync_missing_position_count = 0
+                self._last_position_reconcile_dt = datetime.now()
 
                 self.write_log(
                     f"🩹 [SYNC] 恢复 entry 信息: entry_price={self.entry_price:.2f} "

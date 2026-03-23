@@ -62,7 +62,7 @@ class ZNormalizer:
         self._sum_x2 = 0.0
 
     def normalize(self, value: float) -> float:
-        if len(self._buf) == self._window:
+        if len(self._buf) >= self._window:
             old = self._buf[0]
             self._sum_x -= old
             self._sum_x2 -= old * old
@@ -606,9 +606,9 @@ def calc_tape_aggressor(
       1. Quote rule: trade at or above ask 遶翫・buy; at or below bid 遶翫・sell.
       2. Tick rule (fallback for mid-spread prints): compare to previous trade.
     """
-    if trade_price >= ask:
+    if trade_price > ask:
         return +1.0
-    if trade_price <= bid:
+    if trade_price < bid:
         return -1.0
     if prev_trade_price is not None:
         if trade_price > prev_trade_price:
@@ -1049,8 +1049,9 @@ class KabuSignalStack:
         if len(self._mom_q) < 2:
             self.momentum = 0.0
             return
-        mean = sum(self._mom_q) / len(self._mom_q)
-        self.momentum = 0.0 if mean == 0 else (self._mom_q[-1] - mean) / mean
+        mom_list = list(self._mom_q)
+        mean = sum(mom_list[:-1]) / (len(mom_list) - 1)
+        self.momentum = 0.0 if mean == 0 else (mom_list[-1] - mean) / mean
 
     def _update_regime(self, snap: TickSnapshot) -> None:
         """Detect market regime using lag-1 sign autocorrelation of returns.
@@ -1712,7 +1713,10 @@ if _VNPY_AVAILABLE:
 
         def on_init(self) -> None:
             self.write_log(f"on_init {self.vt_symbol} vol={self.trade_volume}")
-            self.load_tick(1)
+            try:
+                self.load_tick(1)
+            except Exception as e:
+                self.write_log(f"[WARN] load_tick(1) failed: {e} — skip")
             self.put_event()
 
         def on_start(self) -> None:

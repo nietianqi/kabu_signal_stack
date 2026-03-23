@@ -797,6 +797,10 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         if inferred <= 0 and live_price > 0:
             inferred = self._get_tse_pricetick(live_price)
             source = f"TSE表-fallback({live_price:.0f}→{inferred})"
+            if inferred > 0:
+                # 合约对象尚未注册到 MainEngine 时，也允许用实时价推断出的 tick 进入“已验证”状态。
+                # 否则像 7267.TSE 这类 1.0 tick 股票会长期卡在“price_tick未验证(1.0)”。
+                self._price_tick_verified = True
 
         if inferred > 0 and inferred != self.price_tick:
             self.write_log(f"🔧 [price_tick纠偏] {self.price_tick} → {inferred}  来源:{source}")

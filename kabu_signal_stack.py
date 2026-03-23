@@ -1495,6 +1495,11 @@ if _VNPY_AVAILABLE:
         smart_cancel_on_flip: bool = True        # When True: cancel PENDING_OPEN order immediately
                                                  # if the entry signal reverses (no waiting for timeout)
         smart_cancel_min_pending_sec: float = 0.8  # minimum resting time before smart cancel can fire
+        smart_cancel_queue_noise_grace_sec: float = 1.8  # extra grace in QUEUE/NOISE to reduce cancel churn
+        smart_cancel_confirm_ticks: int = 1      # consecutive cancel-condition hits required in NORMAL
+        smart_cancel_queue_noise_confirm_ticks: int = 3  # consecutive hits required in QUEUE/NOISE
+        smart_cancel_extreme_alpha_mult: float = 1.8     # alpha_flip strength multiplier for instant cancel
+        smart_cancel_extreme_fair_drift_ticks: float = 4.0  # instant cancel when fair drift is extreme
 
         # --- v5 parameters ---
         # Per-trade JPY emergency stop (from reference strategy)
@@ -1559,6 +1564,9 @@ if _VNPY_AVAILABLE:
             "auto_tp_retry_max", "auto_tp_retry_delay_sec",
             "auto_tp_fast_retries", "auto_tp_slow_retry_sec",
             "smart_cancel_on_flip", "smart_cancel_min_pending_sec",
+            "smart_cancel_queue_noise_grace_sec",
+            "smart_cancel_confirm_ticks", "smart_cancel_queue_noise_confirm_ticks",
+            "smart_cancel_extreme_alpha_mult", "smart_cancel_extreme_fair_drift_ticks",
             "max_tick_stale_seconds", "stale_feed_force_flatten",
             # v5
             "max_loss_per_trade_jpy",
@@ -1692,6 +1700,8 @@ if _VNPY_AVAILABLE:
             self._market_prev_mid: float = 0.0
             self._pending_entry_fair_price: float = 0.0
             self._pending_entry_alpha: float = 0.0
+            self._smart_cancel_last_reason: str = ""
+            self._smart_cancel_reason_hits: int = 0
 
             # Signal engine (rebuilt with live parameters in on_start)
             self.sig = KabuSignalStack(SignalConfig(), 1.0)
@@ -2096,6 +2106,7 @@ if _VNPY_AVAILABLE:
                 self._maker_escape_pending = False
                 self._pending_entry_fair_price = 0.0
                 self._pending_entry_alpha = 0.0
+                self._reset_smart_cancel_tracker()
                 self.write_log(
                     f"FILL OPEN {self._entry_direction} "
                     f"avg={self._entry_fill_price:.1f} vol={self._entry_fill_volume:.0f}"
@@ -2437,6 +2448,7 @@ if _VNPY_AVAILABLE:
                 self._pending_open_orphan_since = None
                 self._pending_entry_fair_price = fair_price
                 self._pending_entry_alpha = self.sig.edge_score
+                self._reset_smart_cancel_tracker()
                 self._clear_pending_auto_tp()
                 self.order_state = OrderState.PENDING_OPEN.value
                 self.last_signal = (
@@ -2464,6 +2476,7 @@ if _VNPY_AVAILABLE:
                 self._pending_open_orphan_since = None
                 self._pending_entry_fair_price = fair_price
                 self._pending_entry_alpha = self.sig.edge_score
+                self._reset_smart_cancel_tracker()
                 self._clear_pending_auto_tp()
                 self.order_state = OrderState.PENDING_OPEN.value
                 self.last_signal = (
@@ -2811,6 +2824,8 @@ if _VNPY_AVAILABLE:
 
             self._reconcile_active_orders(now)
             elapsed = (now - self._state_since).total_seconds()
+            if self._order_state != OrderState.PENDING_OPEN:
+                self._reset_smart_cancel_tracker()
 
             # Recovery guard: sometimes order callbacks leave PENDING_OPEN with
             # neither active order IDs nor any fill. Give it a short grace window,
@@ -2865,15 +2880,13 @@ if _VNPY_AVAILABLE:
                 and not self._maker_escape_pending
             ):
                 smart_cancel_grace = max(0.0, float(self.smart_cancel_min_pending_sec))
-                if self._market_state == MarketState.QUEUE:
-                    smart_cancel_grace = max(smart_cancel_grace, 1.2)
-                if self.sig.regime == "NOISE":
-                    smart_cancel_grace = max(smart_cancel_grace, 1.0)
+                queue_or_noise = (
+                    self._market_state == MarketState.QUEUE
+                    or self.sig.regime == "NOISE"
+                )
+                if queue_or_noise:
+                    smart_cancel_grace = max(smart_cancel_grace, float(self.smart_cancel_queue_noise_grace_sec))
                 if elapsed >= smart_cancel_grace:
-                    queue_or_noise = (
-                        self._market_state == MarketState.QUEUE
-                        or self.sig.regime == "NOISE"
-                    )
                     signal_gone = (
                         (self._entry_direction == "LONG" and not self.sig.can_open_long())
                         or (self._entry_direction == "SHORT" and not self.sig.can_open_short())
@@ -2901,11 +2914,47 @@ if _VNPY_AVAILABLE:
                         fair_drift = fair_drift_ticks >= fair_drift_limit
                     if queue_or_noise and signal_gone and not (alpha_flip or fair_drift):
                         signal_gone = False
-                    if signal_gone or alpha_flip or fair_drift:
-                        reason = "signal_flip" if signal_gone else ("alpha_flip" if alpha_flip else "fair_drift")
+                    reason = ""
+                    if signal_gone:
+                        reason = "signal_flip"
+                    elif alpha_flip:
+                        reason = "alpha_flip"
+                    elif fair_drift:
+                        reason = "fair_drift"
+
+                    if not reason:
+                        self._reset_smart_cancel_tracker()
+                    else:
+                        required_hits = max(1, int(self.smart_cancel_confirm_ticks))
+                        if queue_or_noise:
+                            required_hits = max(required_hits, int(self.smart_cancel_queue_noise_confirm_ticks))
+
+                        extreme_alpha = (
+                            alpha_flip
+                            and abs(self.sig.edge_score) >= alpha_flip_min * max(1.0, float(self.smart_cancel_extreme_alpha_mult))
+                        )
+                        extreme_drift = (
+                            fair_drift
+                            and fair_drift_ticks >= max(
+                                fair_drift_limit,
+                                float(self.smart_cancel_extreme_fair_drift_ticks),
+                            )
+                        )
+                        if extreme_alpha or extreme_drift:
+                            required_hits = 1
+
+                        if not self._smart_cancel_confirmed(reason, required_hits):
+                            if self.verbose_log:
+                                self.write_log(
+                                    f"[SMART CANCEL HOLD] {reason} "
+                                    f"{self._smart_cancel_reason_hits}/{required_hits}"
+                                )
+                            return
+
                         self.write_log(
                             f"[SMART CANCEL] {reason} during PENDING_OPEN ({self._entry_direction})"
                             + (f" drift={fair_drift_ticks:.2f}t" if fair_drift else "")
+                            + (f" confirms={self._smart_cancel_reason_hits}/{required_hits}" if required_hits > 1 else "")
                         )
                         sent = self._rl_cancel_all(now)
                         if sent:
@@ -2913,6 +2962,8 @@ if _VNPY_AVAILABLE:
                             self._cancel_waiting_ack = True
                             self._state_since = now
                         return
+                else:
+                    self._reset_smart_cancel_tracker()
 
             # --- MAKER escape: runs before the full open timeout ---
             if (
@@ -3006,6 +3057,7 @@ if _VNPY_AVAILABLE:
             fair_price, _ = self._fair_and_reservation(snap)
             self._pending_entry_fair_price = fair_price
             self._pending_entry_alpha = self.sig.edge_score
+            self._reset_smart_cancel_tracker()
             self.write_log(
                 f"MAKER escape retry -> TAKER {self._entry_direction} @ "
                 f"{(snap.ask1 if self._entry_direction == 'LONG' else snap.bid1):.1f} x{vol}"
@@ -3436,6 +3488,19 @@ if _VNPY_AVAILABLE:
                     f"check adapter sanity or reverse_bid_ask setting"
                 )
 
+        def _reset_smart_cancel_tracker(self) -> None:
+            self._smart_cancel_last_reason = ""
+            self._smart_cancel_reason_hits = 0
+
+        def _smart_cancel_confirmed(self, reason: str, required_hits: int) -> bool:
+            need = max(1, int(required_hits))
+            if reason == self._smart_cancel_last_reason:
+                self._smart_cancel_reason_hits += 1
+            else:
+                self._smart_cancel_last_reason = reason
+                self._smart_cancel_reason_hits = 1
+            return self._smart_cancel_reason_hits >= need
+
         def _reset_position_state(self) -> None:
             self._order_state = OrderState.IDLE
             self._active_orderids = []
@@ -3462,5 +3527,6 @@ if _VNPY_AVAILABLE:
             self._signal_pending_dt = None
             self._pending_entry_fair_price = 0.0
             self._pending_entry_alpha = 0.0
+            self._reset_smart_cancel_tracker()
             self._clear_pending_auto_tp()
             self._stale_force_flatten_pending = False

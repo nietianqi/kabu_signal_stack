@@ -115,6 +115,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     ENTRY_SYNC_RETRY_INTERVAL = 1.0           # entry 恢复失败后的重试间隔（秒）
     ENTRY_SYNC_CLEAR_MISSES = 3               # 连续确认 broker 无仓后清理本地残留状态
     POSITION_RECONCILE_INTERVAL = 1.0         # broker/local 持仓对账间隔（秒）
+    EXIT_RETRY_COOLDOWN_SECONDS = 2.0         # 平仓提交失败后的重试冷却（秒）
+    EXIT_COOLDOWN_LOG_INTERVAL = 2.0          # 冷却日志节流间隔（秒）
 
     # 连亏计数
     CONTINUOUS_LOSS_COUNT_THRESHOLD = 5       # 连亏次数阈值（用于日志显示）
@@ -407,6 +409,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
         self._last_entry_sync_attempt_dt: Optional[datetime] = None
         self._entry_sync_missing_position_count: int = 0
         self._last_position_reconcile_dt: Optional[datetime] = None
+        self._exit_retry_allowed_after: Optional[datetime] = None
+        self._last_exit_cooldown_log_dt: Optional[datetime] = None
 
         # LOB 内存
         self._prev_bid_prices: List[float] = []
@@ -483,6 +487,36 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
     def _dt_diff_seconds(self, a: datetime, b: datetime) -> float:
         a2, b2 = self._align_datetimes(a, b)
         return (a2 - b2).total_seconds()
+
+    def _can_attempt_emergency_exit(self, reason: str) -> bool:
+        """Throttle repeated emergency exit attempts after submit failures."""
+        if not self._exit_retry_allowed_after:
+            return True
+
+        now = datetime.now()
+        if now >= self._exit_retry_allowed_after:
+            self._exit_retry_allowed_after = None
+            self._last_exit_cooldown_log_dt = None
+            return True
+
+        if (
+            self._last_exit_cooldown_log_dt is None
+            or (now - self._last_exit_cooldown_log_dt).total_seconds() >= self.EXIT_COOLDOWN_LOG_INTERVAL
+        ):
+            remain = (self._exit_retry_allowed_after - now).total_seconds()
+            self.write_log(f"⏳ [EXIT-COOLDOWN] {reason} 冷却中，{remain:.1f}s 后重试")
+            self._last_exit_cooldown_log_dt = now
+        return False
+
+    def _mark_exit_submit_failed(self, side_label: str) -> None:
+        """Reset in-progress flag and start retry cooldown after failed exits."""
+        self.exit_in_progress = False
+        now = datetime.now()
+        self._exit_retry_allowed_after = now + timedelta(seconds=self.EXIT_RETRY_COOLDOWN_SECONDS)
+        self._last_exit_cooldown_log_dt = now
+        self.write_log(
+            f"⚠️ [EXIT-FAIL] {side_label}平仓单提交失败，{self.EXIT_RETRY_COOLDOWN_SECONDS:.1f}s后重试"
+        )
 
     def _apply_runtime_safety_overrides(self) -> None:
         """Guard against tp_only configurations that disable every loss exit."""
@@ -1934,6 +1968,8 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
 
             # 检查是否触发兜底止损
             if unrealized_pnl < self.max_loss_per_trade:
+                if not self._can_attempt_emergency_exit("MAX_LOSS"):
+                    return
                 self.write_log(
                     f"🚨 [兜底止损] 触发! 未实现亏损={unrealized_pnl:.0f} < {self.max_loss_per_trade:.0f}"
                 )
@@ -2406,8 +2442,7 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             f"预估:{_est_pnl:+.0f}¥ 持{_hold_s:.0f}s"
         )
         if not vt_orderids:
-            self.write_log(f"⚠️ [EXIT-FAIL] 多头平仓单提交失败，重置exit_in_progress以允许重试")
-            self.exit_in_progress = False
+            self._mark_exit_submit_failed("多头")
 
     def _aggressive_flat_short(self, price: float, reason: str):
         if self.exit_in_progress:
@@ -2431,10 +2466,13 @@ class KabuMicroEdgeProOptimizedNew(CtaTemplate):
             f"预估:{_est_pnl:+.0f}¥ 持{_hold_s:.0f}s"
         )
         if not vt_orderids:
-            self.write_log(f"⚠️ [EXIT-FAIL] 空头平仓单提交失败，重置exit_in_progress以允许重试")
-            self.exit_in_progress = False
+            self._mark_exit_submit_failed("空头")
 
     def _emergency_close(self, tick: TickData, reason: str):
+        if self.exit_in_progress:
+            return
+        if not self._can_attempt_emergency_exit(reason):
+            return
         bid1, ask1 = self._get_bid_ask_1(tick)
         pt = self.price_tick if self.price_tick > 0 else 1.0
         self.cancel_all()
